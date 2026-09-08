@@ -3,7 +3,7 @@ import psutil
 from datetime import datetime
 import os
 
-identificador_servidor = "" # Insira identificador do seu Servidor Aqui!
+identificador_servidor = input('Digite o identificador do seu servidor aqui: ')
 
 while True:
 
@@ -11,7 +11,7 @@ while True:
     if not os.path.exists(f"./{identificador_servidor}.csv"):
         with open(f"./{identificador_servidor}.csv", 'w') as csvfile:
             # Escrevendo o cabeçalho
-            csv.writer(csvfile, delimiter=';').writerow(['identificador', 'timestamp','frequency_cpu' , 'percentage_cpu', 'memory_ram_total', 'memory_ram_available', 'percentage_storage', 'storege_available'])
+            csv.writer(csvfile, delimiter=';').writerow(['identifier', 'timestamp','frequency_cpu' , 'percentage_cpu', 'memory_ram_total', 'memory_ram_available', 'percentage_storage', 'storege_available'])
     else:
         # Descobrindo a data e hora atual
         data_hora_atual = datetime.now()
