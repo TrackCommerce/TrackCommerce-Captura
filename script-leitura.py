@@ -4,12 +4,15 @@ import datetime
 
 identificador_servidor = input('Digite o identificador do seu servidor aqui: ')
 
-parametro_porcentagem_cpu = 80
+parametro_porcentagem_cpu = 80.0
 parametro_freq = 2.4
-parametro_porcentagem_ram = 75
-parametro_quantidade_ram = 4
-parametro_porcentagem_disco = 85
-parametro_quantidade_disco = 100
+parametro_porcentagem_ram = 75.0
+parametro_quantidade_ram = 4.0
+parametro_porcentagem_disco = 85.0
+parametro_quantidade_disco = 100.0
+parametro_latencia = 100.0
+parametro_download = 300.0
+parametro_upload = 200.0
 
 if not os.path.exists(f"./{identificador_servidor}.csv"):
     print(f'Não existe o arquivo CSV: {identificador_servidor}. Garanta que você escreveu o identificador corretamente!')
@@ -24,6 +27,9 @@ else:
         maior_uso_ram = 0
         maior_porcentagem_disco = 0
         maior_uso_disco = 0
+        maior_latencia = 0
+        maior_download = 0
+        maior_upload = 0
 
         # Armazenando o menor valor de cada componente
         menor_porcentagem_cpu = 101
@@ -32,6 +38,9 @@ else:
         menor_uso_ram = 101
         menor_porcentagem_disco = 101
         menor_uso_disco = 300
+        menor_latencia = 1000
+        menor_download = 10000
+        menor_upload = 10000
 
         # Armazenando o horário com maior uso de cada componente
         horario_maior_porcentagem_cpu = 0
@@ -40,6 +49,9 @@ else:
         horario_maior_uso_ram = 0
         horario_maior_porcentagem_disco = 0
         horario_maior_uso_disco = 0
+        horario_maior_latencia = 0
+        horario_maior_download = 0
+        horario_maior_upload = 0
 
         # Armazenando o horário com menor uso de cada componente
         horario_menor_porcentagem_cpu = 0
@@ -48,6 +60,9 @@ else:
         horario_menor_uso_ram = 0
         horario_menor_porcentagem_disco = 0
         horario_menor_uso_disco = 0
+        horario_menor_latencia = 0
+        horario_menor_download = 0
+        horario_menor_upload = 0
 
 
         # Quantidade de alertas em cada componente
@@ -57,6 +72,9 @@ else:
         alerta_quantidade_ram = 0
         alerta_porcentagem_disco = 0
         alerta_quantidade_disco = 0
+        alerta_latencia = 0
+        alerta_download = 0
+        alerta_upload = 0
 
         # Pulando o cabeçalho
         next(leitura_total)
@@ -71,12 +89,12 @@ else:
                 maior_porcentagem_cpu = float(linha[3])
                 horario_maior_porcentagem_cpu = linha[1]
 
-            if(round(((float(linha[4]) - float(linha[5])) / float(linha[4]) * 100), 2) > maior_uso_ram):
-                maior_uso_ram = round(((float(linha[4]) - float(linha[5])) / float(linha[4]) * 100), 2)
+            if(round((float(linha[5]) / 1024 ** 3), 2) > maior_uso_ram):
+                maior_uso_ram = round((float(linha[5]) / 1024 ** 3), 2)
                 horario_maior_uso_ram = linha[1]
 
-            if(round((float(linha[5]) / 1024 ** 3), 2) > maior_porcentagem_ram):
-                maior_porcentagem_ram = round((float(linha[5]) / 1024 ** 3), 2)
+            if(round(((float(linha[4]) - float(linha[5])) / float(linha[4]) * 100), 2) > maior_porcentagem_ram):
+                maior_porcentagem_ram = round(((float(linha[4]) - float(linha[5])) / float(linha[4]) * 100), 2)
                 horario_maior_porcentagem_ram = linha[1]
 
             if(float(linha[6]) > maior_porcentagem_disco):
@@ -86,6 +104,18 @@ else:
             if(round((float(linha[7]) / 1024 ** 3), 2) > maior_uso_disco):
                 maior_uso_disco = round((float(linha[7]) / 1024 ** 3), 2)
                 horario_maior_uso_disco = linha[1]
+
+            if((float(linha[8]) * 1000) > maior_latencia):
+                maior_latencia = (float(linha[8]) * 1000)
+                horario_maior_latencia = linha[1]
+
+            if(float(linha[9]) > maior_download):
+                maior_download = float(linha[9])
+                horario_maior_download = linha[1]
+
+            if(float(linha[10]) > maior_upload):
+                maior_upload = float(linha[10])
+                horario_maior_upload = linha[1]
 
             # Descobrindo qual é o horário de maior consumo de cada componente
             if((float(linha[2]) / 1000) < menor_consumo_freq):
@@ -112,6 +142,18 @@ else:
                 menor_uso_disco = round((float(linha[7]) / 1024 ** 3), 2)
                 horario_menor_uso_disco = linha[1]
 
+            if((float(linha[8]) * 1000) < menor_latencia):
+                menor_latencia = (float(linha[8]) * 1000)
+                horario_menor_latencia = linha[1]
+
+            if(float(linha[9]) < menor_download):
+                menor_download = float(linha[9])
+                horario_menor_download = linha[1]
+
+            if(float(linha[10]) < menor_upload):
+                menor_upload = float(linha[10])
+                horario_menor_upload = linha[1]
+
             # Capturando quantidade de alerta em cada componente
             if(parametro_freq <= float(linha[2]) / 1000):
                 alerta_freq += 1
@@ -131,6 +173,15 @@ else:
             if(parametro_quantidade_disco <= round((float(linha[7]) / 1024 ** 3), 2)):
                 alerta_quantidade_disco += 1
 
+            if(parametro_latencia <= round(float(linha[8]) * 1000), 2):
+                alerta_latencia += 1
+
+            if(parametro_download <= float(linha[9])):
+                alerta_download += 1
+
+            if(parametro_upload <= float(linha[10])):
+                alerta_upload += 1
+
     print('\n')
 
     print('======== Horários com Maior Consumo de Cada Componente ========')
@@ -140,6 +191,9 @@ else:
     print(f'Consumo (GB) de Memória RAM: {horario_maior_uso_ram} - {maior_uso_ram} GB')
     print(f'Porcetagem de Armazenamento em Disco: {horario_maior_porcentagem_disco} - {maior_porcentagem_disco}%')
     print(f'Consumo (GB) de Armazenamento em Disco: {horario_maior_uso_disco} - {maior_uso_disco} GM')
+    print(f'Tempo (ms) da latência da API de pagamento: {horario_maior_latencia} - {maior_latencia} ms')
+    print(f'Tempo (Mbps) de Download: {horario_maior_download} - {maior_download} Mbps')
+    print(f'Tempo (Mbps) de Upload: {horario_maior_upload} - {maior_upload} Mbps')
 
     print('\n')
 
@@ -150,6 +204,9 @@ else:
     print(f'Consumo (GB) de Memória RAM: {horario_menor_uso_ram} - {menor_uso_ram}GB')
     print(f'Porcetagem de Armazenamento em Disco: {horario_menor_porcentagem_disco} - {menor_porcentagem_disco}%')
     print(f'Consumo (GB) de Armazenamento em Disco: {horario_menor_uso_disco} - {menor_uso_disco}GB')
+    print(f'Tempo (ms) da latência da API de pagamento: {horario_maior_latencia} - {maior_latencia} ms')
+    print(f'Tempo (Mbps) de Download: {horario_menor_download} - {menor_download} Mbps')
+    print(f'Tempo (Mbps) de Upload: {horario_menor_upload} - {menor_upload} Mbps')
 
     print('\n')
 
@@ -160,5 +217,7 @@ else:
     print(f'Consumo (GB) de Memória RAM: {alerta_quantidade_ram}')
     print(f'Porcetagem de Armazenamento em Disco: {alerta_porcentagem_disco}')
     print(f'Consumo (GB) de Armazenamento em Disco: {alerta_quantidade_disco}')
+    print(f'Tempo (Mbps) de Download: {alerta_download}')
+    print(f'Tempo (Mbps) de Upload: {alerta_upload}')
 
     print('\n')
