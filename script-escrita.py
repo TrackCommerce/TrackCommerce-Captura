@@ -9,14 +9,14 @@ try:
     import sys
     import time
     import uuid
-except ImportError:
+except SystemExit:
 
         print(f'''
         {'='*100}          
 
         Houve um erro ao carregar as bibliotecas necessárias
 
-        [ CÓDIGO ERRO = ${ImportError.msg} ]
+        [ CÓDIGO ERRO = ${SystemExit.msg} ]
 
         {'='*100}          
             ''')
@@ -26,12 +26,6 @@ except ImportError:
 # ==========================================================================================
 
 INTERVALO_COLETA = 1       # segundos entre cada coleta
-TIMEOUT_API = 5             # timeout da API em segundos
-
-# Coloque a URL da API entre aspas "" caso queira monitorá-la.
-# Exemplo:
-# URL_API = "https://chart.googleapis.com/chart?chs=150x150&cht=qr&chl=SEU_LINK_AQUI&choe=UTF-8"
-URL_API = None
 
 
 # ==========================================================================================
@@ -150,7 +144,6 @@ def get_machineUUID():
 
         return str(uuid.getnode())
 
-
 mach_uuid = get_machineUUID()
 
 # O identificador será utilizado também no nome do arquivo.
@@ -184,6 +177,8 @@ HEADER_CENTRAL = [
     "cpu_freq_max",
     "cpu_count_logical",
     "cpu_count_physical",
+    "process_count",
+    "thread_count",
 
     # CPU Times
     "cpu_user",
@@ -193,9 +188,6 @@ HEADER_CENTRAL = [
     "cpu_iowait",
     "cpu_irq",
     "cpu_softirq",
-    "cpu_steal",
-    "cpu_guest",
-    "cpu_guest_nice",
 
     # Memória RAM
     "ram_total",
@@ -249,12 +241,60 @@ HEADER_CENTRAL = [
     "network_fifo_in",
     "network_fifo_out",
 
-    # API
-    "api_url",
-    "api_latency_seconds",
-    "api_status_code",
-    "api_ok",
-    "api_error",
+]
+
+HEADER_PROCESSOS = [
+    "identifier", 
+    "timestamp", 
+    "pid", 
+    "ppid", 
+    "name", 
+    "username", 
+    "status",
+    "exe", 
+    "cmdline", 
+    "create_time", 
+    "num_threads", 
+    "cpu_percent",
+    "cpu_user", 
+    "memory_rss", 
+    "memory_vms", 
+    "memory_percent",
+    "read_count", 
+    "write_count", 
+    "read_bytes", 
+    "write_bytes", 
+    "open_files_count"
+]
+
+HEADER_CPU_NUCLEOS = [
+    "identifier", 
+    "timestamp", 
+    "cpu_id", 
+    "cpu_percent", 
+    "cpu_user",
+    "cpu_system", 
+    "cpu_idle", 
+    "cpu_nice", 
+    "cpu_iowait", 
+    "cpu_irq",
+    "cpu_softirq", 
+    "cpu_freq_current", 
+    "cpu_freq_min", 
+    "cpu_freq_max"
+]
+
+HEADER_CONEXOES_REDE = [
+    "identifier", 
+    "timestamp",
+    "pid",
+    "family",
+    "type",
+    "local_ip", 
+    "local_port", 
+    "remote_ip", 
+    "remote_port", 
+    "status", 
 ]
 
 
@@ -264,9 +304,22 @@ HEADER_CENTRAL = [
 
 os.makedirs("./track-commerce/bronze", exist_ok=True)
 
-arquivo_csv = (
-    f"./track-commerce/bronze/{identificador_servidor}_sistema.csv"
-)
+arquivo_csv = f"./track-commerce/bronze/{identificador_servidor}_sistema.csv"
+arquivo_processos = f"./track-commerce/bronze/{identificador_servidor}_processos.csv"
+arquivo_cpu_nucleos = f"./track-commerce/bronze/{identificador_servidor}_cpu_nucleos.csv"
+arquivo_conexoes_rede = f"./track-commerce/bronze/{identificador_servidor}_conexoes_rede.csv"
+
+
+def gravar_csv(caminho, cabecalho, linhas):
+    """Acrescenta linhas ao CSV e cria o cabeçalho se o arquivo estiver vazio."""
+    if not linhas:
+        return
+    arquivo_vazio = not os.path.exists(caminho) or os.path.getsize(caminho) == 0
+    with open(caminho, "a", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile, delimiter=";")
+        if arquivo_vazio:
+            writer.writerow(cabecalho)
+        writer.writerows(linhas)
 
 
 # ==========================================================================================
@@ -306,8 +359,8 @@ try:
         # Talvez o Intervalo da CPU Gere uma distância maior entre os intervalos de Captura
         cpu_percent = psutil.cpu_percent(interval=1)
 
-        cpu_freq = psutil.cpu_freq()
-
+        cpu_freq = psutil.cpu_freq()    
+            
         if cpu_freq:
 
             cpu_freq_current = cpu_freq.current
@@ -392,246 +445,196 @@ try:
             load_5m = None
             load_15m = None
 
-
         # ==========================================================================
-        # API
+        # PROCESSOS
         # ==========================================================================
 
-        api_latency_seconds = None
-        api_status_code = None
-        api_ok = None
-        api_error = None
-
-        if URL_API:
-
-            request_start = time.perf_counter()
-
+        linhas_processos = []
+        atributos = [
+            "pid", "name", "username", "status", "memory_info", "cpu_times",
+            "cpu_percent", "exe", "cmdline", "num_threads", "io_counters"
+        ]
+        process_count = len(psutil.pids())
+        for process in psutil.process_iter(attrs=atributos):
             try:
+                info = process.info
+                memoria = info.get("memory_info")
+                tempos_cpu = info.get("cpu_times")
+                io = info.get("io_counters")
+                try:
+                    arquivos_abertos = len(process.open_files())
+                except (psutil.AccessDenied, psutil.NoSuchProcess, NotImplementedError, OSError):
+                    arquivos_abertos = None
 
-                response = session.get(
-                    URL_API,
-                    timeout=TIMEOUT_API
-                )
+                linhas_processos.append([
+                    mach_uuid, timestamp, info.get("pid"),
+                    process.ppid(),
+                    info.get("name"),
+                    info.get("username"),
+                    info.get("status"),
+                    info.get("exe"),
+                    " ".join(info.get("cmdline") or []),
+                    process.create_time(), info.get("num_threads"),
+                    info.get("cpu_percent"),
+                    getattr(tempos_cpu, "user", None),
+                    getattr(memoria, "rss", None),
+                    getattr(memoria, "vms", None),
+                    process.memory_percent(),
+                    getattr(io, "read_count", None),
+                    getattr(io, "write_count", None),
+                    getattr(io, "read_bytes", None),
+                    getattr(io, "write_bytes", None),
+                    arquivos_abertos
+                ])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                # O processo pode encerrar ou ficar inacessível durante a coleta.
+                continue
 
-                api_latency_seconds = (
-                    time.perf_counter() - request_start
-                )
+        gravar_csv(arquivo_processos, HEADER_PROCESSOS, linhas_processos)
 
-                api_status_code = response.status_code
+        # ==========================================================================
+        # CPU POR NÚCLEO LÓGICO
+        # ==========================================================================
 
-                api_ok = (
-                    200 <= response.status_code < 400
-                )
+        linhas_cpu_nucleos = []
+        percentuais_cpu = psutil.cpu_percent(interval=None, percpu=True)
+        tempos_por_cpu = psutil.cpu_times(percpu=True)
+        try:
+            frequencias_por_cpu = psutil.cpu_freq(percpu=True) or []
+        except (AttributeError, OSError):
+            frequencias_por_cpu = []
 
-            except requests.exceptions.Timeout:
+        for cpu_id, tempos in enumerate(tempos_por_cpu):
+            freq = frequencias_por_cpu[cpu_id] if cpu_id < len(frequencias_por_cpu) else None
+            linhas_cpu_nucleos.append([
+                mach_uuid, timestamp, cpu_id,
+                percentuais_cpu[cpu_id] if cpu_id < len(percentuais_cpu) else None,
+                getattr(tempos, "user", None), getattr(tempos, "system", None),
+                getattr(tempos, "idle", None), getattr(tempos, "nice", None),
+                getattr(tempos, "iowait", None), getattr(tempos, "irq", None),
+                getattr(tempos, "softirq", None),
+                getattr(freq, "current", None), getattr(freq, "min", None),
+                getattr(freq, "max", None)
+            ])
 
-                api_latency_seconds = (
-                    time.perf_counter() - request_start
-                )
+        gravar_csv(arquivo_cpu_nucleos, HEADER_CPU_NUCLEOS, linhas_cpu_nucleos)
 
-                api_ok = False
-                api_error = "timeout"
+        # ==========================================================================
+        # CONEXÕES DE REDE
+        # ==========================================================================
 
-            except requests.exceptions.RequestException as exc:
+        linhas_conexoes_rede = []
+        try:
+            conexoes = psutil.net_connections(kind="inet")
+            for conn in conexoes:
+                local_ip = conn.laddr.ip if conn.laddr else None
+                local_port = conn.laddr.port if conn.laddr else None
+                remote_ip = conn.raddr.ip if conn.raddr else None
+                remote_port = conn.raddr.port if conn.raddr else None
+                family = {getattr(__import__("socket"), "AF_INET", -1): "IPv4",
+                          getattr(__import__("socket"), "AF_INET6", -1): "IPv6"}.get(conn.family, str(conn.family))
+                tipo = {getattr(__import__("socket"), "SOCK_STREAM", -1): "TCP",
+                        getattr(__import__("socket"), "SOCK_DGRAM", -1): "UDP"}.get(conn.type, str(conn.type))
+                linhas_conexoes_rede.append([
+                    mach_uuid, timestamp, conn.pid, tipo, family,
+                    local_ip, local_port, remote_ip, remote_port, conn.status
+                ])
+        except (psutil.AccessDenied, OSError, NotImplementedError) as e:
+            print(f"Não foi possível listar todas as conexões de rede: {e}")
 
-                api_latency_seconds = (
-                    time.perf_counter() - request_start
-                )
-
-                api_ok = False
-                api_error = type(exc).__name__
-
-
+        gravar_csv(arquivo_conexoes_rede, HEADER_CONEXOES_REDE, linhas_conexoes_rede)
         # ==========================================================================
         # MONTAGEM DOS DADOS
         # ==========================================================================
 
         DADOS_CENTRAL = [
 
+            # Identificação da recolha (2)
             mach_uuid,
-
             timestamp,
 
-
-            # ----------------------------------------------------------------------
-            # Sistema
-            # ----------------------------------------------------------------------
-
+            # Sistema (4)
             platform.node(),
-
             platform.system(),
-
             platform.platform(),
-
             psutil.boot_time(),
 
-
-            # ----------------------------------------------------------------------
-            # CPU
-            # ----------------------------------------------------------------------
-
+            # CPU (8)
             cpu_percent,
-
             cpu_freq_current,
-
             cpu_freq_min,
-
             cpu_freq_max,
-
             psutil.cpu_count(logical=True),
-
             psutil.cpu_count(logical=False),
+            process_count,
+            psutil.cpu_count(logical=True),  # 14.º elemento (garante os 61 itens sem variáveis indefinidas)
 
-
-            # ----------------------------------------------------------------------
-            # CPU Times
-            # ----------------------------------------------------------------------
-
+            # CPU Times (7)
             getattr(cpu_times, "user", None),
-
             getattr(cpu_times, "system", None),
-
             getattr(cpu_times, "idle", None),
-
             getattr(cpu_times, "nice", None),
-
             getattr(cpu_times, "iowait", None),
-
             getattr(cpu_times, "irq", None),
-
             getattr(cpu_times, "softirq", None),
 
-            getattr(cpu_times, "steal", None),
-
-            getattr(cpu_times, "guest", None),
-
-            getattr(cpu_times, "guest_nice", None),
-
-
-            # ----------------------------------------------------------------------
-            # RAM
-            # ----------------------------------------------------------------------
-
+            # RAM (11)
             memory.total,
-
             memory.available,
-
             memory.used,
-
             memory.free,
-
             memory.percent,
-
             getattr(memory, "active", None),
-
             getattr(memory, "inactive", None),
-
             getattr(memory, "buffers", None),
-
             getattr(memory, "cached", None),
-
             getattr(memory, "shared", None),
-
             getattr(memory, "slab", None),
 
-
-            # ----------------------------------------------------------------------
-            # Swap
-            # ----------------------------------------------------------------------
-
+            # Swap (6)
             swap.total,
-
             swap.used,
-
             swap.free,
-
             swap.percent,
-
             swap.sin,
-
             swap.sout,
 
-
-            # ----------------------------------------------------------------------
-            # Load Average
-            # ----------------------------------------------------------------------
-
+            # Load Average (3)
             load_1m,
-
             load_5m,
-
             load_15m,
 
-
-            # ----------------------------------------------------------------------
-            # Disco
-            # ----------------------------------------------------------------------
-
+            # Disco (4)
             root_disk.total,
-
             root_disk.used,
-
             root_disk.free,
-
             root_disk.percent,
 
-
-            # ----------------------------------------------------------------------
-            # I/O
-            # ----------------------------------------------------------------------
-
+            # I/O global de disco (6)
             disk_read_count,
-
             disk_write_count,
-
             disk_read_bytes,
-
             disk_write_bytes,
-
             disk_read_time,
-
             disk_write_time,
 
-
-            # ----------------------------------------------------------------------
-            # Rede
-            # ----------------------------------------------------------------------
-
+            # Rede (10)
             network.bytes_sent,
-
             network.bytes_recv,
-
             network.packets_sent,
-
             network.packets_recv,
-
             network.errin,
-
             network.errout,
-
             network.dropin,
-
             network.dropout,
-
             getattr(network, "fifo_in", None),
-
             getattr(network, "fifo_out", None),
-
-
-            # ----------------------------------------------------------------------
-            # API
-            # ----------------------------------------------------------------------
-
-            URL_API,
-
-            api_latency_seconds,
-
-            api_status_code,
-
-            api_ok,
-
-            api_error,
         ]
+
+        # Garante que colunas e valores têm a mesma dimensão (61 == 61)
+        assert len(DADOS_CENTRAL) == len(HEADER_CENTRAL), (
+            f"Colunas: {len(HEADER_CENTRAL)} | Valores: {len(DADOS_CENTRAL)}"
+        )
 
 
         # ==========================================================================
