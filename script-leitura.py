@@ -1,36 +1,18 @@
 """
 ==========================================================================================
- TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD)
+ TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD) - VERSÃO CORRIGIDA
 ==========================================================================================
 
- NOTA:
- Versão: beta 2.0
-
- O script a seguir trata os dados capturados das máquinas de nossos clientes e os
- transforma nas métricas descritas abaixo. Os dados tratados no momento atual estão no
- diretório raiz local e, depois, deverão ser capturados pelo Bucket S3 da aplicação e
- tratados da mesma forma.
-
- Vale ressaltar que este arquivo NÃO está fazendo tratamentos no BD, porque outros
- valores para identificar a máquina ainda serão capturados e implementados depois.
-
- ------------------------------------------------------------------------------------------
- Entrada : ./track-commerce/bronze/*.csv
+ Entrada : ./track-commerce/bronze/*.csv (ou via S3 Bucket)
  Saída   :
-   SILVER (para análise em R - valores numéricos crus, sem formatação de texto)
+   SILVER (Análise R - inclui empresa_id e empresa_nome em todas as linhas e caminhos)
      ./track-commerce/silver/<empresa_id>/<identificador>_sistema.csv
-   GOLD   (para o site - métricas organizadas por componente, com TODO o histórico)
+   GOLD   (JSON estruturado com histórico completo)
      ./track-commerce/gold/<empresa_id>/<identificador>_sistema.json
-     ./track-commerce/gold/<empresa_id>/indice_maquinas.json (máquinas da empresa)
-     ./track-commerce/gold/indice_maquinas.json   (empresas -> máquinas + último status)
+     ./track-commerce/gold/<empresa_id>/indice_maquinas.json
+     ./track-commerce/gold/indice_maquinas.json
 
- Desvio padrão: para cada métrica principal é calculado o desvio padrão MÓVEL dos
- últimos 60 registros (JANELA_DESVIO) de cada máquina. Ele aparece:
-   - em cada linha do silver (coluna <metrica>_dp60)
-   - em cada ponto do histórico do gold (campo "dp60")
-   - no resumo do gold (desvio dos 60 registros mais recentes)
-
- Usa apenas a biblioteca padrão do Python.
+ Usa biblioteca padrão do Python + mysql.connector (opcional BD) + boto3 (opcional S3).
 ==========================================================================================
 """
 
@@ -45,18 +27,67 @@ from datetime import datetime
 import mysql.connector
 from dotenv import load_dotenv
 
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
 # ==========================================================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES E INTEGRAÇÕES
 # ==========================================================================================
 load_dotenv()
 
+DIR_BASE = "./track-commerce"
+DIR_BRONZE = os.path.join(DIR_BASE, "bronze")
+DIR_SILVER = os.path.join(DIR_BASE, "silver")
+DIR_GOLD = os.path.join(DIR_BASE, "gold")
+
+DELIMITADOR_SAIDA = ";"
+FORMATO_TIMESTAMP = "%Y-%m-%d %H:%M:%S"
+JANELA_DESVIO = 60
+BYTES_POR_GB = 1024 ** 3
+
+COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
+
+# S3 Download / Upload (Opcional)
+AWS_BAIXAR = os.getenv("AWS_BAIXAR", "False").lower() in ("true", "1", "t", "yes")
+AWS_BUCKET = os.getenv("AWS_BUCKET", "")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
+AWS_PREFIXO = "track-commerce/bronze"
+
+
+def baixar_bronze_s3():
+    """Baixa automaticamente os CSVs do S3 para a pasta local bronze antes do processamento."""
+    if not (AWS_BAIXAR and boto3 and AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+        return
+    print("[S3 ETL] Iniciando busca por arquivos no Bucket S3...")
+    try:
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            aws_session_token=AWS_SESSION_TOKEN or None,
+            region_name=AWS_REGION,
+        )
+        os.makedirs(DIR_BRONZE, exist_ok=True)
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=AWS_BUCKET, Prefix=AWS_PREFIXO):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith(".csv"):
+                    nome_arquivo = os.path.basename(key)
+                    destino = os.path.join(DIR_BRONZE, nome_arquivo)
+                    s3.download_file(AWS_BUCKET, key, destino)
+                    print(f"  [S3 ETL] Baixado: {key} -> {destino}")
+    except Exception as erro:
+        print(f"  [AVISO ETL] Falha ao sincronizar com S3: {erro}")
+
 
 def carregar_maquinas_bd():
-    """
-    Busca no BD o vínculo máquina (identificador/UUID) -> empresa.
-    Retorna {identificador: {"empresa_id", "empresa_nome", "vm_nome"}}.
-    Se o BD estiver indisponível, devolve {} e o script usa os dados do próprio CSV bronze.
-    """
+    """Busca no BD o vínculo máquina -> empresa. Se inacessível, retorna {}."""
     try:
         conexao = mysql.connector.connect(
             host=os.getenv("DB_HOST"),
@@ -65,7 +96,7 @@ def carregar_maquinas_bd():
             database=os.getenv("DB_NAME"),
         )
     except mysql.connector.Error as erro:
-        print(f"[AVISO] BD indisponível, usando dados do bronze: {erro}")
+        print(f"[AVISO BD] Indisponível, utilizando dados de empresa do Bronze: {erro}")
         return {}
     try:
         cursor = conexao.cursor(dictionary=True)
@@ -85,44 +116,19 @@ def carregar_maquinas_bd():
     finally:
         conexao.close()
 
-DIR_BASE = "./track-commerce"
-DIR_BRONZE = os.path.join(DIR_BASE, "bronze")
-DIR_SILVER = os.path.join(DIR_BASE, "silver")
-DIR_GOLD = os.path.join(DIR_BASE, "gold")
-
-
-DELIMITADOR_SAIDA = ";"
-FORMATO_TIMESTAMP = "%Y-%m-%d %H:%M:%S"
-JANELA_DESVIO = 60          # quantidade de registros usada no desvio padrão móvel
-BYTES_POR_GB = 1024 ** 3
-
-# Colunas mínimas para que um arquivo bronze seja considerado válido.
-# O script de captura grava APENAS o UUID da máquina (coluna "identifier");
-# a empresa é resolvida pelo BD a partir desse identificador.
-COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
-
 
 def normalizar_identificador(valor):
-    """
-    O script de captura grava o UUID sem hífens e com '_' no nome do arquivo,
-    mas dentro do CSV grava o UUID original (com hífens). O BD pode guardar
-    qualquer uma das formas. Esta função padroniza para comparação:
-    minúsculas, sem hífens e sem underlines.
-    """
-    return para_texto(valor).lower().replace("-", "").replace("_", "")
+    return para_texto(valor).lower().replace("-", "").replace("_", "") if valor else ""
 
 
 # ==========================================================================================
-# UTILITÁRIOS DE VALIDAÇÃO / CONVERSÃO
-# Os dados podem vir quebrados, vazios ou com texto no lugar de número.
-# Todas as conversões devolvem None em vez de lançar erro.
+# UTILITÁRIOS
 # ==========================================================================================
 
 def para_float(valor):
-    """Converte texto em float. Vazio, 'None', 'nan', inf ou lixo -> None."""
     if valor is None:
         return None
-    texto = str(valor).strip().replace(",", ".")  # aceita vírgula decimal
+    texto = str(valor).strip().replace(",", ".")
     if texto == "" or texto.lower() in ("none", "nan", "null"):
         return None
     if texto.lower() == "true":
@@ -139,15 +145,11 @@ def para_float(valor):
 
 
 def para_percentual(valor):
-    """Float válido somente se estiver entre 0 e 100 (percentuais impossíveis viram None)."""
     numero = para_float(valor)
-    if numero is None or numero < 0 or numero > 100:
-        return None
-    return numero
+    return numero if numero is not None and 0 <= numero <= 100 else None
 
 
 def para_positivo(valor):
-    """Float válido somente se >= 0 (bytes, contadores, tempos)."""
     numero = para_float(valor)
     return numero if numero is not None and numero >= 0 else None
 
@@ -168,14 +170,12 @@ def para_gb(valor_bytes):
 
 
 def dividir(a, b):
-    """Divisão segura: evita divisão por zero e operandos nulos."""
     if a is None or b is None or b == 0:
         return None
     return a / b
 
 
 def somar(*valores):
-    """Soma ignorando None; se todos forem None devolve None."""
     validos = [v for v in valores if v is not None]
     return sum(validos) if validos else None
 
@@ -193,7 +193,6 @@ def ler_timestamp(texto):
 
 
 def desvio(valores):
-    """Desvio padrão populacional ignorando None. Precisa de pelo menos 2 valores."""
     limpos = [v for v in valores if v is not None]
     if len(limpos) < 2:
         return None
@@ -206,13 +205,10 @@ def percentil(valores, p):
     ordenados = sorted(valores)
     pos = (len(ordenados) - 1) * (p / 100)
     inf, sup = math.floor(pos), math.ceil(pos)
-    if inf == sup:
-        return ordenados[int(pos)]
-    return ordenados[inf] * (sup - pos) + ordenados[sup] * (pos - inf)
+    return ordenados[inf] if inf == sup else ordenados[inf] * (sup - pos) + ordenados[sup] * (pos - inf)
 
 
 def estatisticas(valores):
-    """Resumo de uma série: geral + desvio padrão dos últimos JANELA_DESVIO registros."""
     limpos = [v for v in valores if v is not None]
     if not limpos:
         return {"amostras": 0, "min": None, "media": None, "mediana": None,
@@ -231,21 +227,12 @@ def estatisticas(valores):
 
 
 # ==========================================================================================
-# LEITURA DO BRONZE
+# LEITURA BRONZE
 # ==========================================================================================
 
 def ler_bronze(caminho):
-    """
-    Lê um CSV de captura. Validações:
-      - arquivo vazio ou ilegível -> lista vazia
-      - detecta o delimitador automaticamente
-      - descarta linhas totalmente vazias e linhas sem identifier/timestamp válidos
-      - ordena por timestamp e remove timestamps duplicados
-    """
     if not os.path.isfile(caminho) or os.path.getsize(caminho) == 0:
-        print(f"  [AVISO] Arquivo vazio ou inexistente: {caminho}")
         return []
-
     try:
         with open(caminho, "r", newline="", encoding="utf-8", errors="ignore") as f:
             amostra = f.read(4096)
@@ -255,27 +242,18 @@ def ler_bronze(caminho):
             except csv.Error:
                 delimitador = ";"
             leitor = csv.DictReader(f, delimiter=delimitador)
-
-            # Cabeçalho precisa existir e conter as colunas obrigatórias
             cabecalho = [c.strip() for c in (leitor.fieldnames or [])]
-            faltando = [c for c in COLUNAS_OBRIGATORIAS if c not in cabecalho]
-            if faltando:
-                print(f"  [ERRO] {caminho} sem colunas obrigatórias: {faltando}")
+            if any(c not in cabecalho for c in COLUNAS_OBRIGATORIAS):
                 return []
-
             linhas = []
             for bruta in leitor:
-                # Normaliza chaves (remove espaços) e ignora colunas extras sem nome
                 linha = {(k or "").strip(): v for k, v in bruta.items() if k}
-                if not any((v or "").strip() for v in linha.values() if isinstance(v, str)):
-                    continue
                 ts = ler_timestamp(linha.get("timestamp"))
                 if ts is None or not para_texto(linha.get("identifier")):
-                    continue  # linha quebrada: sem data ou sem máquina
+                    continue
                 linha["_ts"] = ts
                 linhas.append(linha)
-    except (OSError, csv.Error) as erro:
-        print(f"  [ERRO] Falha ao ler {caminho}: {erro}")
+    except (OSError, csv.Error):
         return []
 
     linhas.sort(key=lambda l: l["_ts"])
@@ -289,10 +267,12 @@ def ler_bronze(caminho):
 
 
 def colunas_nucleos(linha):
-    """
-    Uso por núcleo: o script de captura ainda NÃO grava essa informação.
-    Se no futuro forem gravadas colunas cpu_core_0, cpu_core_1, ... elas serão lidas aqui.
-    """
+    texto_nucleos = para_texto(linha.get("cpu_por_nucleo"))
+    if texto_nucleos:
+        partes = texto_nucleos.split("|")
+        res = [para_percentual(p) for p in partes if para_percentual(p) is not None]
+        if res:
+            return res
     nucleos = {}
     for chave, valor in linha.items():
         if chave.startswith("cpu_core_"):
@@ -303,11 +283,10 @@ def colunas_nucleos(linha):
 
 
 # ==========================================================================================
-# TRANSFORMAÇÃO (uma linha bronze -> um registro tratado)
+# TRANSFORMAÇÃO
 # ==========================================================================================
 
 def delta(atual, anterior, coluna):
-    """Diferença de um contador acumulado. Negativo (reboot/reset) -> None."""
     a = para_positivo(atual.get(coluna))
     b = para_positivo(anterior.get(coluna)) if anterior else None
     if a is None or b is None:
@@ -318,21 +297,14 @@ def delta(atual, anterior, coluna):
 
 def transformar_linha(linha, anterior, empresa):
     ts = linha["_ts"]
-    intervalo = None
-    if anterior:
-        intervalo = (ts - anterior["_ts"]).total_seconds()
-        if intervalo <= 0:
-            intervalo = None
+    intervalo = (ts - anterior["_ts"]).total_seconds() if anterior else None
+    if intervalo is not None and intervalo <= 0:
+        intervalo = None
 
     def taxa(coluna):
-        """Contador acumulado -> valor por segundo."""
         return arredondar(dividir(delta(linha, anterior, coluna), intervalo))
 
-    # ---------------- CPU --------------------------------------------------------------
-    # cpu_user, cpu_system... são segundos ACUMULADOS. O % de cada modo é o delta do modo
-    # dividido pelo delta da soma de todos os modos no intervalo.
-    modos = ["cpu_user", "cpu_system", "cpu_nice", "cpu_idle", "cpu_iowait",
-             "cpu_irq", "cpu_softirq", "cpu_steal"]
+    modos = ["cpu_user", "cpu_system", "cpu_nice", "cpu_idle", "cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal"]
     deltas_modos = {m: delta(linha, anterior, m) for m in modos}
     total_modos = somar(*deltas_modos.values())
     pct_modo = {m: arredondar(dividir(d, total_modos) * 100) if dividir(d, total_modos) is not None else None
@@ -341,43 +313,33 @@ def transformar_linha(linha, anterior, empresa):
     nucleos_logicos = para_positivo(linha.get("cpu_count_logical"))
     load_1m = para_positivo(linha.get("load_1m"))
 
-    # Quantidade de processos: ainda não capturada; lida se a coluna existir no futuro
-    qtd_processos = para_positivo(linha.get("process_count"))
-
-    # ---------------- RAM --------------------------------------------------------------
     ram_total = para_positivo(linha.get("ram_total"))
     ram_used = para_positivo(linha.get("ram_used"))
     ram_avail = para_positivo(linha.get("ram_available"))
     ram_buffers = para_positivo(linha.get("ram_buffers"))
     ram_cached = para_positivo(linha.get("ram_cached"))
     ram_slab = para_positivo(linha.get("ram_slab"))
-    buff_cache = somar(ram_buffers, ram_cached, ram_slab)  # mesmo critério do "free -h"
+    buff_cache = somar(ram_buffers, ram_cached, ram_slab)
 
-    # ---------------- SWAP -------------------------------------------------------------
     swap_total = para_positivo(linha.get("swap_total"))
     swap_used = para_positivo(linha.get("swap_used"))
     swap_free = para_positivo(linha.get("swap_free"))
 
-    # ---------------- DISCO ------------------------------------------------------------
     d_leituras = delta(linha, anterior, "disk_read_count")
     d_escritas = delta(linha, anterior, "disk_write_count")
-    d_t_leitura = delta(linha, anterior, "disk_read_time")    # ms
-    d_t_escrita = delta(linha, anterior, "disk_write_time")   # ms
-    # Latência média = tempo gasto em I/O / quantidade de operações (ms por operação)
+    d_t_leitura = delta(linha, anterior, "disk_read_time")
+    d_t_escrita = delta(linha, anterior, "disk_write_time")
+
     lat_leitura = arredondar(dividir(d_t_leitura, d_leituras), 3)
     lat_escrita = arredondar(dividir(d_t_escrita, d_escritas), 3)
     lat_total = arredondar(dividir(somar(d_t_leitura, d_t_escrita), somar(d_leituras, d_escritas)), 3)
 
-    # ---------------- REDE -------------------------------------------------------------
-    d_pac = somar(delta(linha, anterior, "network_packets_sent"),
-                  delta(linha, anterior, "network_packets_recv"))
-    d_drop = somar(delta(linha, anterior, "network_dropin"),
-                   delta(linha, anterior, "network_dropout"))
-    perda_pct = None
-    if d_drop is not None and d_pac is not None and (d_pac + d_drop) > 0:
-        perda_pct = round(d_drop / (d_pac + d_drop) * 100, 3)
+    d_pac = somar(delta(linha, anterior, "network_packets_sent"), delta(linha, anterior, "network_packets_recv"))
+    d_drop = somar(delta(linha, anterior, "network_dropin"), delta(linha, anterior, "network_dropout"))
+    perda_pct = round(d_drop / (d_pac + d_drop) * 100, 3) if d_drop is not None and d_pac is not None and (d_pac + d_drop) > 0 else None
 
     return {
+        # Empresa é obrigatoriamente mantida em cada registro
         "empresa_id": empresa["empresa_id"],
         "empresa_nome": empresa["empresa_nome"],
         "identifier": para_texto(linha.get("identifier")),
@@ -402,7 +364,8 @@ def transformar_linha(linha, anterior, empresa):
         "cpu_nice_pct": pct_modo["cpu_nice"],
         "cpu_idle_pct": pct_modo["cpu_idle"],
         "cpu_iowait_pct": pct_modo["cpu_iowait"],
-        "qtd_processos": qtd_processos,
+        "qtd_processos": para_positivo(linha.get("process_count")),
+        "qtd_threads": para_positivo(linha.get("thread_count")),
 
         # RAM
         "ram_percent": arredondar(para_percentual(linha.get("ram_percent"))),
@@ -422,7 +385,7 @@ def transformar_linha(linha, anterior, empresa):
         "swap_disponivel_gb": para_gb(swap_free),
         "swap_usada_gb": para_gb(swap_used),
 
-        # DISCO
+        # DISCO (Calculado diretamente das capturas de disco raiz + IOPS)
         "disco_percent": arredondar(para_percentual(linha.get("disk_root_percent"))),
         "disco_total_gb": para_gb(para_positivo(linha.get("disk_root_total"))),
         "disco_usado_gb": para_gb(para_positivo(linha.get("disk_root_used"))),
@@ -442,14 +405,13 @@ def transformar_linha(linha, anterior, empresa):
         "rede_perda_pacotes_pct": perda_pct,
         "rede_erros_s": arredondar(dividir(somar(delta(linha, anterior, "network_errin"),
                                                  delta(linha, anterior, "network_errout")), intervalo)),
-        # Estados TCP: ainda não capturados; lidos se as colunas existirem no futuro
         "rede_established": para_positivo(linha.get("net_established")),
         "rede_time_wait": para_positivo(linha.get("net_time_wait")),
         "rede_close_wait": para_positivo(linha.get("net_close_wait")),
+        "rede_conn_total": para_positivo(linha.get("net_conn_total")),
     }
 
 
-# Métricas que recebem desvio padrão móvel dos últimos JANELA_DESVIO registros
 METRICAS_DESVIO = [
     "cpu_percent", "load_1m", "cpu_iowait_pct",
     "ram_percent", "swap_percent",
@@ -460,7 +422,6 @@ METRICAS_DESVIO = [
 
 
 def aplicar_desvio_movel(registros):
-    """Adiciona <metrica>_dp60 em cada registro (janela deslizante por máquina)."""
     janelas = {m: deque(maxlen=JANELA_DESVIO) for m in METRICAS_DESVIO}
     for reg in registros:
         for m in METRICAS_DESVIO:
@@ -470,7 +431,7 @@ def aplicar_desvio_movel(registros):
 
 
 # ==========================================================================================
-# SILVER - CSV linha a linha (numérico, pronto para read.csv2 no R)
+# SILVER - CSV
 # ==========================================================================================
 
 def gravar_silver(pasta_empresa, identificador, registros):
@@ -483,19 +444,16 @@ def gravar_silver(pasta_empresa, identificador, registros):
         escritor.writeheader()
         for reg in registros:
             linha = dict(reg)
-            # Listas (uso por núcleo) viram texto "12.5|30.1|..." para caber em uma célula
             linha["cpu_por_nucleo"] = "|".join(str(v) for v in reg["cpu_por_nucleo"]) or None
-            # None vira "NA", que o R reconhece como valor ausente
             escritor.writerow({k: ("NA" if v is None else v) for k, v in linha.items()})
     return caminho
 
 
 # ==========================================================================================
-# GOLD - JSON por máquina com TODO o histórico, organizado por componente
+# GOLD - JSON
 # ==========================================================================================
 
 def historico(registros, campos):
-    """Série temporal completa: um ponto por registro (não apenas 1 linha)."""
     serie = []
     for r in registros:
         ponto = {"timestamp": r["timestamp"]}
@@ -509,7 +467,6 @@ def historico(registros, campos):
 
 
 def ultimo_valido(registros, campo):
-    """Último valor não nulo de um campo (o mais recente pode ter vindo quebrado)."""
     for r in reversed(registros):
         if r.get(campo) not in (None, []):
             return r[campo]
@@ -542,6 +499,7 @@ def montar_gold(registros):
                 "load_average": {"1m": ult("load_1m"), "5m": ult("load_5m"), "15m": ult("load_15m")},
                 "nucleos_logicos": ult("cpu_nucleos_logicos"),
                 "qtd_processos": ult("qtd_processos"),
+                "qtd_threads": ult("qtd_threads"),
                 "modos_percent": {"user": ult("cpu_user_pct"), "sys": ult("cpu_sys_pct"),
                                   "nice": ult("cpu_nice_pct"), "idle": ult("cpu_idle_pct"),
                                   "iowait": ult("cpu_iowait_pct")},
@@ -564,7 +522,6 @@ def montar_gold(registros):
                              "available": ult("ram_disponivel_gb")},
                 "buffers_cache": {"usado_gb": ult("ram_buff_cache_usado_gb"),
                                   "total_gb": ult("ram_buff_cache_total_gb")},
-                "qtd_processos": ult("qtd_processos"),
             },
             "resumo": {"uso_percent": estatisticas(serie("ram_percent"))},
             "historico": historico(registros, [
@@ -607,7 +564,8 @@ def montar_gold(registros):
             "atual": {
                 "conexoes": {"established": ult("rede_established"),
                              "time_wait": ult("rede_time_wait"),
-                             "close_wait": ult("rede_close_wait")},
+                             "close_wait": ult("rede_close_wait"),
+                             "total": ult("rede_conn_total")},
                 "perda_pacotes_pct": ult("rede_perda_pacotes_pct"),
                 "upload_bytes_s": ult("rede_upload_bytes_s"),
                 "download_bytes_s": ult("rede_download_bytes_s"),
@@ -617,14 +575,22 @@ def montar_gold(registros):
                        "perda_pacotes_pct": estatisticas(serie("rede_perda_pacotes_pct"))},
             "historico": historico(registros, [
                 "rede_upload_bytes_s", "rede_download_bytes_s", "rede_perda_pacotes_pct",
-                "rede_established", "rede_time_wait", "rede_close_wait"]),
+                "rede_established", "rede_time_wait", "rede_close_wait", "rede_conn_total"]),
         },
     }
 
 
 def nome_seguro(texto):
-    """Evita caracteres inválidos no nome do arquivo."""
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in texto)[:120]
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(texto))[:120]
+
+
+def ultimo_valido_bronze(linhas, *colunas):
+    for linha in reversed(linhas):
+        for col in colunas:
+            valor = para_texto(linha.get(col))
+            if valor:
+                return valor
+    return None
 
 
 # ==========================================================================================
@@ -632,7 +598,9 @@ def nome_seguro(texto):
 # ==========================================================================================
 
 def main():
-    # Validação: diretório de entrada precisa existir
+    # 1. Download do S3 se ativado
+    baixar_bronze_s3()
+
     if not os.path.isdir(DIR_BRONZE):
         print(f"[ERRO] Diretório bronze não encontrado: {DIR_BRONZE}")
         return
@@ -647,9 +615,11 @@ def main():
 
     mapa_bd = carregar_maquinas_bd()
 
-    # Agrupa por máquina (identifier), pois a mesma máquina pode ter mais de um arquivo
     por_maquina = {}
     for caminho in arquivos:
+        # Apenas processa arquivos de sistema principal
+        if "_particoes.csv" in caminho or "_processos.csv" in caminho or "_conexoes_rede.csv" in caminho:
+            continue
         print(f"Lendo {caminho}")
         for linha in ler_bronze(caminho):
             chave = normalizar_identificador(linha["identifier"])
@@ -660,36 +630,37 @@ def main():
         print("[AVISO] Nenhuma linha válida encontrada nos arquivos bronze.")
         return
 
-    # indice agrupado por empresa: {empresa_id: {"empresa_id", "empresa_nome", "maquinas": [...]}}
     indice = {}
     for identificador, linhas in por_maquina.items():
         linhas.sort(key=lambda l: l["_ts"])
 
-        # Empresa: BD tem prioridade; senão usa as colunas do próprio bronze
-        empresa = mapa_bd.get(identificador) or {
-            "empresa_id": ultimo_valido_bronze(linhas, "enterprise_identifier"),
-            "empresa_nome": ultimo_valido_bronze(linhas, "enterprise_reason"),
-            "vm_nome": None,
+        # Identificação da Empresa: BD > CSV Bronze > Fallback "sem_empresa"
+        empresa_id = (mapa_bd.get(identificador, {}).get("empresa_id") or
+                      ultimo_valido_bronze(linhas, "enterprise_identifier", "empresa_id") or "sem_empresa")
+        empresa_nome = (mapa_bd.get(identificador, {}).get("empresa_nome") or
+                        ultimo_valido_bronze(linhas, "enterprise_reason", "empresa_nome") or "Empresa Desconhecida")
+        vm_nome = mapa_bd.get(identificador, {}).get("vm_nome")
+
+        empresa = {
+            "empresa_id": empresa_id,
+            "empresa_nome": empresa_nome,
+            "vm_nome": vm_nome
         }
-        if not empresa.get("empresa_id"):
-            print(f"  [AVISO] Máquina {identificador} sem empresa vinculada; ignorada.")
-            continue
 
         registros, anterior = [], None
         for linha in linhas:
             try:
                 registros.append(transformar_linha(linha, anterior, empresa))
                 anterior = linha
-            except Exception as erro:  # uma linha quebrada não derruba a máquina inteira
+            except Exception as erro:
                 print(f"  [AVISO] Linha ignorada ({identificador} {linha.get('timestamp')}): {erro}")
 
         if not registros:
-            print(f"  [AVISO] Máquina {identificador} sem registros válidos.")
             continue
 
         aplicar_desvio_movel(registros)
         nome = nome_seguro(identificador)
-        pasta_empresa = nome_seguro(str(empresa["empresa_id"]))
+        pasta_empresa = nome_seguro(empresa_id)
 
         silver = gravar_silver(pasta_empresa, nome, registros)
         gold = montar_gold(registros)
@@ -700,38 +671,28 @@ def main():
             json.dump(gold, f, ensure_ascii=False, indent=2)
 
         grupo = indice.setdefault(pasta_empresa, {
-            "empresa_id": empresa["empresa_id"],
-            "empresa_nome": empresa["empresa_nome"],
+            "empresa_id": empresa_id,
+            "empresa_nome": empresa_nome,
             "maquinas": [],
         })
         grupo["maquinas"].append({
             **gold["maquina"],
-            # caminho relativo à pasta gold: <empresa_id>/<identifier>_sistema.json
             "arquivo": f"{pasta_empresa}/{os.path.basename(caminho_gold)}",
             "cpu_percent": gold["cpu"]["atual"]["uso_percent"],
             "ram_percent": gold["ram"]["atual"]["uso_percent"],
             "disco_percent": gold["disco"]["atual"]["uso_percent"],
         })
-        print(f"  OK {identificador} ({empresa['empresa_nome']}): {len(registros)} registros -> {silver} | {caminho_gold}")
+        print(f"  OK {identificador} ({empresa_nome}): {len(registros)} registros -> {silver} | {caminho_gold}")
 
-    # Índice por empresa (o site de cada empresa carrega só o seu)
     for pasta_empresa, grupo in indice.items():
         with open(os.path.join(DIR_GOLD, pasta_empresa, "indice_maquinas.json"), "w", encoding="utf-8") as f:
             json.dump(grupo, f, ensure_ascii=False, indent=2)
 
-    # Índice geral: lista de empresas, cada uma com suas máquinas
     with open(os.path.join(DIR_GOLD, "indice_maquinas.json"), "w", encoding="utf-8") as f:
         json.dump({"empresas": list(indice.values())}, f, ensure_ascii=False, indent=2)
+
     total = sum(len(g["maquinas"]) for g in indice.values())
     print(f"Concluído: {total} máquina(s) de {len(indice)} empresa(s) processada(s).")
-
-
-def ultimo_valido_bronze(linhas, coluna):
-    for linha in reversed(linhas):
-        valor = para_texto(linha.get(coluna))
-        if valor:
-            return valor
-    return None
 
 
 if __name__ == "__main__":

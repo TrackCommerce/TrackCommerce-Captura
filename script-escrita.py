@@ -1,31 +1,68 @@
+"""
+==========================================================================================
+ TRACK COMMERCE - CAPTURA DE MÉTRICAS
+==========================================================================================
+"""
+import csv
+import datetime
+import os
+import platform
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+# Bibliotecas externas
 try:
-    import csv
-    import datetime
-    import os
-    import platform
     import psutil
-    import requests
-    import subprocess
-    import sys
-    import time
-    import uuid
-except SystemExit:
+except ImportError as erro:
+    print(f"\n{'=' * 100}\nErro ao carregar a biblioteca psutil: {erro}\nInstale com: pip install psutil\n{'=' * 100}")
+    sys.exit(1)
 
-        print(f'''
-        {'='*100}          
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 
-        Houve um erro ao carregar as bibliotecas necessárias
-
-        [ CÓDIGO ERRO = ${SystemExit.msg} ]
-
-        {'='*100}          
-            ''')
 
 # ==========================================================================================
 # CONFIGURAÇÕES
 # ==========================================================================================
 
-INTERVALO_COLETA = 1       # segundos entre cada coleta
+INTERVALO_COLETA = 1       # segundos de espera entre ciclos
+INTERVALO_CPU = 1          # segundos de medição do uso de CPU (bloqueante)
+TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
+
+# Partições ignoradas no monitoramento
+FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"} # Partições não especificadas no arquivo de Capturas de Métricas e no Figma
+
+# Configurações AWS S3 (opcional) -- Posteriormente ajustado no .env (provavelmente)
+AWS_ENVIAR = os.getenv("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
+AWS_BUCKET = os.getenv("AWS_BUCKET", "")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
+AWS_PREFIXO = "track-commerce/bronze"
+INTERVALO_UPLOAD_S = int(os.getenv("INTERVALO_UPLOAD_S", "300"))
+
+
+# ==========================================================================================
+# DIRETÓRIO PADRÃO DA APLICAÇÃO
+# ==========================================================================================
+
+def diretorio_aplicacao():
+    """Pasta onde a aplicação está (script .py ou executável empacotado)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DIR_APP = diretorio_aplicacao()
+os.chdir(DIR_APP)
+DIR_BRONZE = os.path.join(DIR_APP, "track-commerce", "bronze")
+os.makedirs(DIR_BRONZE, exist_ok=True)
 
 
 # ==========================================================================================
@@ -44,21 +81,7 @@ print(f'''
 {'=' * 100}
 ''')
 
-
-# ==========================================================================================
-# SESSÃO HTTP
-# ==========================================================================================
-
-session = requests.Session()
-
-
-# ==========================================================================================
-# IDENTIFICAÇÃO DO SISTEMA
-# ==========================================================================================
-
-so_name = platform.system()
-
-print(f"Sistema: {so_name}")
+print(f"Sistema: {platform.system()}")
 
 
 # ==========================================================================================
@@ -66,252 +89,106 @@ print(f"Sistema: {so_name}")
 # ==========================================================================================
 
 def get_machineUUID():
-
+    """Devolve um identificador estável da máquina (UUID de hardware ou machine-id)."""
     try:
-
-        # ----------------------------------------------------------------------
-        # Windows
-        # ----------------------------------------------------------------------
-
         if sys.platform == "win32":
-
             try:
-                txt = subprocess.check_output(
-                    "wmic csproduct get uuid",
-                    shell=True,
-                    stderr=subprocess.DEVNULL
-                ).decode(errors="ignore")
-
-                linhas = [
-                    linha.strip()
-                    for linha in txt.splitlines()
-                    if linha.strip() and linha.strip().upper() != "UUID"
-                ]
-
+                txt = subprocess.check_output("wmic csproduct get uuid", shell=True,
+                                              stderr=subprocess.DEVNULL).decode(errors="ignore")
+                linhas = [l.strip() for l in txt.splitlines() if l.strip() and l.strip().upper() != "UUID"]
                 if linhas:
-                    uuid_str = linhas[0]
-
                     try:
-                        return str(uuid.UUID(uuid_str))
+                        return str(uuid.UUID(linhas[0]))
                     except ValueError:
-                        return uuid_str
-
+                        return linhas[0]
             except Exception:
                 pass
-
             return str(uuid.getnode())
 
-
-        # ----------------------------------------------------------------------
-        # Linux
-        # ----------------------------------------------------------------------
-
-        elif sys.platform.startswith("linux"):
-
+        if sys.platform.startswith("linux"):
             try:
                 with open("/etc/machine-id", "r", encoding="utf-8") as f:
                     machine_id = f.read().strip()
-
-                # machine-id normalmente possui 32 caracteres hexadecimais.
-                # Converte para um UUID padronizado.
-                if len(machine_id) == 32:
-                    return str(uuid.UUID(machine_id))
-
-                return machine_id
-
+                return str(uuid.UUID(machine_id)) if len(machine_id) == 32 else machine_id
             except (FileNotFoundError, PermissionError):
                 return str(uuid.getnode())
 
-
-        # ----------------------------------------------------------------------
-        # macOS
-        # ----------------------------------------------------------------------
-
-        elif sys.platform == "darwin":
-
-            return str(uuid.getnode())
-
-
-        # ----------------------------------------------------------------------
-        # Outros sistemas
-        # ----------------------------------------------------------------------
-
         return str(uuid.getnode())
-
     except Exception as e:
-
         print(f"Erro ao obter UUID da máquina: {e}")
-
         return str(uuid.getnode())
+
 
 mach_uuid = get_machineUUID()
-
-# O identificador será utilizado também no nome do arquivo.
 identificador_servidor = str(mach_uuid).replace("-", "_")
-# Substitui '-' por '_'
-
-print("UUID da Máquina:")
-print(mach_uuid)
+print(f"UUID da Máquina: {mach_uuid}")
 
 
 # ==========================================================================================
-# CABEÇALHO DO CSV
+# CABEÇALHOS DOS CSVs (COMPLETO E SEM DUPLICAÇÕES)
 # ==========================================================================================
 
-HEADER_CENTRAL = [
-
-    # Identificação da coleta
-    "identifier",
-    "timestamp",
-
-    # Sistema
-    "hostname",
-    "os",
-    "platform",
-    "boot_time",
+HEADER_SISTEMA = [
+    # Identificação
+    "identifier", "timestamp", "hostname", "os", "platform", "boot_time",
 
     # CPU
-    "cpu_percent",
-    "cpu_freq_current",
-    "cpu_freq_min",
-    "cpu_freq_max",
-    "cpu_count_logical",
-    "cpu_count_physical",
-    "process_count",
-    "thread_count",
+    "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
+    "cpu_count_logical", "cpu_count_physical", "process_count", "thread_count",
 
     # CPU Times
-    "cpu_user",
-    "cpu_system",
-    "cpu_idle",
-    "cpu_nice",
-    "cpu_iowait",
-    "cpu_irq",
-    "cpu_softirq",
-
-    # Memória RAM
-    "ram_total",
-    "ram_available",
-    "ram_used",
-    "ram_free",
-    "ram_percent",
-    "ram_active",
-    "ram_inactive",
-    "ram_buffers",
-    "ram_cached",
-    "ram_shared",
-    "ram_slab",
-
-    # Swap
-    "swap_total",
-    "swap_used",
-    "swap_free",
-    "swap_percent",
-    "swap_sin",
-    "swap_sout",
+    "cpu_user", "cpu_system", "cpu_idle", "cpu_nice", "cpu_iowait",
+    "cpu_irq", "cpu_softirq", "cpu_steal",
 
     # Load Average
-    "load_1m",
-    "load_5m",
-    "load_15m",
+    "load_1m", "load_5m", "load_15m",
 
-    # Disco
-    "disk_root_total",
-    "disk_root_used",
-    "disk_root_free",
-    "disk_root_percent",
+    # RAM (bytes)
+    "ram_total", "ram_available", "ram_used", "ram_free", "ram_percent",
+    "ram_active", "ram_inactive", "ram_buffers", "ram_cached", "ram_shared", "ram_slab",
 
-    # I/O global de disco
-    "disk_read_count",
-    "disk_write_count",
-    "disk_read_bytes",
-    "disk_write_bytes",
-    "disk_read_time",
-    "disk_write_time",
+    # Swap (bytes)
+    "swap_total", "swap_used", "swap_free", "swap_percent", "swap_sin", "swap_sout",
 
-    # Rede
-    "network_bytes_sent",
-    "network_bytes_recv",
-    "network_packets_sent",
-    "network_packets_recv",
-    "network_errin",
-    "network_errout",
-    "network_dropin",
-    "network_dropout",
-    "network_fifo_in",
-    "network_fifo_out",
+    # Disco Raiz (restaurado para cálculo correto no ETL)
+    "disk_root_total", "disk_root_used", "disk_root_free", "disk_root_percent",
 
+    # I/O global de disco (contadores acumulados)
+    "disk_read_count", "disk_write_count", "disk_read_bytes", "disk_write_bytes",
+    "disk_read_time", "disk_write_time",
+
+    # Rede (contadores acumulados)
+    "network_bytes_sent", "network_bytes_recv", "network_packets_sent", "network_packets_recv",
+    "network_errin", "network_errout", "network_dropin", "network_dropout",
+
+    # Conexões ativas agregadas por estado
+    "net_conn_total", "net_established", "net_time_wait", "net_close_wait", "net_none", "net_outros",
+]
+
+HEADER_PARTICOES = [
+    "identifier", "timestamp", "device", "mountpoint", "fstype",
+    "total", "used", "free", "percent",
 ]
 
 HEADER_PROCESSOS = [
-    "identifier", 
-    "timestamp", 
-    "pid", 
-    "ppid", 
-    "name", 
-    "username", 
-    "status",
-    "exe", 
-    "cmdline", 
-    "create_time", 
-    "num_threads", 
-    "cpu_percent",
-    "cpu_user", 
-    "memory_rss", 
-    "memory_vms", 
-    "memory_percent",
-    "read_count", 
-    "write_count", 
-    "read_bytes", 
-    "write_bytes", 
-    "open_files_count"
-]
-
-HEADER_CPU_NUCLEOS = [
-    "identifier", 
-    "timestamp", 
-    "cpu_id", 
-    "cpu_percent", 
-    "cpu_user",
-    "cpu_system", 
-    "cpu_idle", 
-    "cpu_nice", 
-    "cpu_iowait", 
-    "cpu_irq",
-    "cpu_softirq", 
-    "cpu_freq_current", 
-    "cpu_freq_min", 
-    "cpu_freq_max"
+    "identifier", "timestamp", "pid", "ppid", "name", "username", "status",
+    "cpu_percent", "memory_percent", "memory_rss_mb", "memory_vms_mb",
+    "num_threads", "read_bytes", "write_bytes"
 ]
 
 HEADER_CONEXOES_REDE = [
-    "identifier", 
-    "timestamp",
-    "pid",
-    "family",
-    "type",
-    "local_ip", 
-    "local_port", 
-    "remote_ip", 
-    "remote_port", 
-    "status", 
+    "identifier", "timestamp", "pid", "type", "family",
+    "local_ip", "local_port", "remote_ip", "remote_port", "status"
 ]
 
-
-# ==========================================================================================
-# ARQUIVO
-# ==========================================================================================
-
-os.makedirs("./track-commerce/bronze", exist_ok=True)
-
-arquivo_csv = f"./track-commerce/bronze/{identificador_servidor}_sistema.csv"
-arquivo_processos = f"./track-commerce/bronze/{identificador_servidor}_processos.csv"
-arquivo_cpu_nucleos = f"./track-commerce/bronze/{identificador_servidor}_cpu_nucleos.csv"
-arquivo_conexoes_rede = f"./track-commerce/bronze/{identificador_servidor}_conexoes_rede.csv"
+arquivo_sistema = os.path.join(DIR_BRONZE, f"{identificador_servidor}_sistema.csv")
+arquivo_particoes = os.path.join(DIR_BRONZE, f"{identificador_servidor}_particoes.csv")
+arquivo_processos = os.path.join(DIR_BRONZE, f"{identificador_servidor}_processos.csv")
+arquivo_conexoes_rede = os.path.join(DIR_BRONZE, f"{identificador_servidor}_conexoes_rede.csv")
 
 
 def gravar_csv(caminho, cabecalho, linhas):
-    """Acrescenta linhas ao CSV e cria o cabeçalho se o arquivo estiver vazio."""
+    """Acrescenta linhas ao CSV e escreve o cabeçalho se o arquivo for novo/vazio."""
     if not linhas:
         return
     arquivo_vazio = not os.path.exists(caminho) or os.path.getsize(caminho) == 0
@@ -323,395 +200,299 @@ def gravar_csv(caminho, cabecalho, linhas):
 
 
 # ==========================================================================================
+# ENVIO OPCIONAL AO S3 (boto3)
+# ==========================================================================================
+
+_cliente_s3 = None
+_s3_desativado = False
+
+
+def obter_cliente_s3():
+    global _cliente_s3, _s3_desativado
+    if _cliente_s3 is not None or _s3_desativado:
+        return _cliente_s3
+    if not AWS_ENVIAR:
+        _s3_desativado = True
+        return None
+    if boto3 is None:
+        print("[AVISO] AWS_ENVIAR=True, mas boto3 não está instalado. Envio ao S3 desativado.")
+        _s3_desativado = True
+        return None
+    if not (AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+        print("[AVISO] Bucket ou credenciais AWS ausentes. Envio ao S3 desativado.")
+        _s3_desativado = True
+        return None
+    try:
+        _cliente_s3 = boto3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            aws_session_token=AWS_SESSION_TOKEN or None,
+            region_name=AWS_REGION,
+        )
+    except Exception as erro:
+        print(f"[AVISO] Não foi possível criar o cliente S3: {erro}")
+        _s3_desativado = True
+    return _cliente_s3
+
+
+def enviar_arquivos_s3(caminhos):
+    cliente = obter_cliente_s3()
+    if cliente is None:
+        return
+    for caminho in caminhos:
+        if not os.path.isfile(caminho):
+            continue
+        chave = f"{AWS_PREFIXO}/{os.path.basename(caminho)}"
+        try:
+            cliente.upload_file(caminho, AWS_BUCKET, chave)
+            print(f"[S3] Enviado: s3://{AWS_BUCKET}/{chave}")
+        except Exception as erro:
+            print(f"[AVISO] Falha ao enviar {caminho} ao S3: {erro}")
+
+
+# ==========================================================================================
+# COLETAS DETALHADAS
+# ==========================================================================================
+
+def coletar_particoes(timestamp):
+    linhas, vistos = [], set()
+    for p in psutil.disk_partitions(all=False):
+        if p.device in vistos or p.fstype.lower() in FS_IGNORADOS or "cdrom" in p.opts:
+            continue
+        try:
+            uso = psutil.disk_usage(p.mountpoint)
+        except (PermissionError, OSError):
+            continue
+        vistos.add(p.device)
+        linhas.append([mach_uuid, timestamp, p.device, p.mountpoint, p.fstype,
+                       uso.total, uso.used, uso.free, uso.percent])
+    return linhas
+
+
+def coletar_processos(timestamp):
+    atributos = ["pid", "ppid", "name", "username", "status", "cpu_percent",
+                 "memory_percent", "memory_info", "num_threads", "io_counters"]
+    linhas = []
+    for proc in psutil.process_iter(attrs=atributos, ad_value=None):
+        try:
+            info = proc.info
+            mem = info.get("memory_info")
+            io = info.get("io_counters")
+            rss_mb = round(mem.rss / (1024 ** 2), 2) if mem and getattr(mem, "rss", None) else None
+            vms_mb = round(mem.vms / (1024 ** 2), 2) if mem and getattr(mem, "vms", None) else None
+            cpu = info.get("cpu_percent")
+            ram = info.get("memory_percent")
+
+            linhas.append([
+                mach_uuid, timestamp, info.get("pid"), proc.ppid(), info.get("name"),
+                info.get("username"), info.get("status"),
+                round(cpu, 2) if cpu is not None else None,
+                round(ram, 2) if ram is not None else None,
+                rss_mb, vms_mb, info.get("num_threads"),
+                getattr(io, "read_bytes", None) if io else None,
+                getattr(io, "write_bytes", None) if io else None
+            ])
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            continue
+
+    linhas.sort(key=lambda l: -((l[7] or 0) + (l[8] or 0)))
+    return linhas[:TOP_PROCESSOS] if TOP_PROCESSOS else linhas
+
+
+def coletar_conexoes_detalhadas(timestamp):
+    """Gera linhas com detalhes de cada conexão ativa na máquina."""
+    linhas = []
+    try:
+        conexoes = psutil.net_connections(kind="inet")
+        for conn in conexoes:
+            local_ip = conn.laddr.ip if conn.laddr else None
+            local_port = conn.laddr.port if conn.laddr else None
+            remote_ip = conn.raddr.ip if conn.raddr else None
+            remote_port = conn.raddr.port if conn.raddr else None
+
+            fam = "IPv4" if conn.family == socket.AF_INET else ("IPv6" if conn.family == getattr(socket, "AF_INET6", -1) else str(conn.family))
+            tp = "TCP" if conn.type == socket.SOCK_STREAM else ("UDP" if conn.type == socket.SOCK_DGRAM else str(conn.type))
+
+            linhas.append([
+                mach_uuid, timestamp, conn.pid, tp, fam,
+                local_ip, local_port, remote_ip, remote_port, conn.status
+            ])
+    except (psutil.AccessDenied, OSError, NotImplementedError):
+        pass
+    return linhas
+
+
+def contar_conexoes_resumo():
+    vazio = {"total": None, "established": None, "time_wait": None,
+             "close_wait": None, "none": None, "outros": None}
+    try:
+        conexoes = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, OSError, NotImplementedError):
+        return vazio
+    estados = {}
+    for c in conexoes:
+        estados[c.status] = estados.get(c.status, 0) + 1
+    principais = {k: estados.get(v, 0) for k, v in
+                  (("established", "ESTABLISHED"), ("time_wait", "TIME_WAIT"),
+                   ("close_wait", "CLOSE_WAIT"), ("none", "NONE"))}
+    total = len(conexoes)
+    return {"total": total, **principais, "outros": total - sum(principais.values())}
+
+
+def coletar_ciclo():
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # CPU
+    por_nucleo = psutil.cpu_percent(interval=INTERVALO_CPU, percpu=True)
+    cpu_percent = round(sum(por_nucleo) / len(por_nucleo), 1) if por_nucleo else None
+    freq = psutil.cpu_freq()
+    tempos = psutil.cpu_times()
+
+    # Memória e Swap
+    memoria = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+
+    # Disco Raiz
+    try:
+        root_disk = psutil.disk_usage(os.path.abspath(os.sep))
+        d_root_total, d_root_used, d_root_free, d_root_pct = root_disk.total, root_disk.used, root_disk.free, root_disk.percent
+    except Exception:
+        d_root_total = d_root_used = d_root_free = d_root_pct = None
+
+    disk_io = psutil.disk_io_counters()
+    rede = psutil.net_io_counters()
+
+    # Load Average
+    try:
+        load_1m, load_5m, load_15m = psutil.getloadavg()
+    except (AttributeError, OSError):
+        load_1m = load_5m = load_15m = None
+
+    # Contagem total de Threads
+    try:
+        total_threads = sum(p.info["num_threads"] for p in psutil.process_iter(attrs=["num_threads"]) if p.info.get("num_threads"))
+    except Exception:
+        total_threads = None
+
+    conexoes_resumo = contar_conexoes_resumo()
+    conexoes_detalhadas = coletar_conexoes_detalhadas(timestamp)
+    processos = coletar_processos(timestamp)
+    particoes = coletar_particoes(timestamp)
+
+    dados = {
+        "identifier": mach_uuid,
+        "timestamp": timestamp,
+        "hostname": platform.node(),
+        "os": platform.system(),
+        "platform": platform.platform(),
+        "boot_time": psutil.boot_time(),
+
+        "cpu_percent": cpu_percent,
+        "cpu_por_nucleo": "|".join(str(v) for v in por_nucleo),
+        "cpu_freq_current": getattr(freq, "current", None),
+        "cpu_freq_min": getattr(freq, "min", None),
+        "cpu_freq_max": getattr(freq, "max", None),
+        "cpu_count_logical": psutil.cpu_count(logical=True),
+        "cpu_count_physical": psutil.cpu_count(logical=False),
+        "process_count": len(psutil.pids()),
+        "thread_count": total_threads,
+
+        "cpu_user": getattr(tempos, "user", None),
+        "cpu_system": getattr(tempos, "system", None),
+        "cpu_idle": getattr(tempos, "idle", None),
+        "cpu_nice": getattr(tempos, "nice", None),
+        "cpu_iowait": getattr(tempos, "iowait", None),
+        "cpu_irq": getattr(tempos, "irq", None),
+        "cpu_softirq": getattr(tempos, "softirq", None),
+        "cpu_steal": getattr(tempos, "steal", None),
+
+        "load_1m": load_1m, "load_5m": load_5m, "load_15m": load_15m,
+
+        "ram_total": memoria.total,
+        "ram_available": memoria.available,
+        "ram_used": memoria.used,
+        "ram_free": memoria.free,
+        "ram_percent": memoria.percent,
+        "ram_active": getattr(memoria, "active", None),
+        "ram_inactive": getattr(memoria, "inactive", None),
+        "ram_buffers": getattr(memoria, "buffers", None),
+        "ram_cached": getattr(memoria, "cached", None),
+        "ram_shared": getattr(memoria, "shared", None),
+        "ram_slab": getattr(memoria, "slab", None),
+
+        "swap_total": swap.total, "swap_used": swap.used, "swap_free": swap.free,
+        "swap_percent": swap.percent, "swap_sin": swap.sin, "swap_sout": swap.sout,
+
+        "disk_root_total": d_root_total,
+        "disk_root_used": d_root_used,
+        "disk_root_free": d_root_free,
+        "disk_root_percent": d_root_pct,
+
+        "disk_read_count": getattr(disk_io, "read_count", None),
+        "disk_write_count": getattr(disk_io, "write_count", None),
+        "disk_read_bytes": getattr(disk_io, "read_bytes", None),
+        "disk_write_bytes": getattr(disk_io, "write_bytes", None),
+        "disk_read_time": getattr(disk_io, "read_time", None),
+        "disk_write_time": getattr(disk_io, "write_time", None),
+
+        "network_bytes_sent": rede.bytes_sent, "network_bytes_recv": rede.bytes_recv,
+        "network_packets_sent": rede.packets_sent, "network_packets_recv": rede.packets_recv,
+        "network_errin": rede.errin, "network_errout": rede.errout,
+        "network_dropin": rede.dropin, "network_dropout": rede.dropout,
+
+        "net_conn_total": conexoes_resumo["total"], "net_established": conexoes_resumo["established"],
+        "net_time_wait": conexoes_resumo["time_wait"], "net_close_wait": conexoes_resumo["close_wait"],
+        "net_none": conexoes_resumo["none"], "net_outros": conexoes_resumo["outros"],
+    }
+
+    gravar_csv(arquivo_sistema, HEADER_SISTEMA, [[dados.get(c) for c in HEADER_SISTEMA]])
+    gravar_csv(arquivo_particoes, HEADER_PARTICOES, particoes)
+    gravar_csv(arquivo_processos, HEADER_PROCESSOS, processos)
+    gravar_csv(arquivo_conexoes_rede, HEADER_CONEXOES_REDE, conexoes_detalhadas)
+
+    print(f"[{timestamp}] CPU={cpu_percent}% | RAM={memoria.percent:.1f}% | "
+          f"Disco Raiz={d_root_pct}% | Conexões={len(conexoes_detalhadas)} | Processos={len(processos)}")
+
+
+# ==========================================================================================
 # INÍCIO DA CAPTURA
 # ==========================================================================================
 
 print(f'''
 Iniciando Captura
 
-Arquivo:
-{arquivo_csv}
+Diretório bronze:
+{DIR_BRONZE}
 
-Intervalo:
-{INTERVALO_COLETA} segundos
+Intervalo: {INTERVALO_COLETA}s (+ {INTERVALO_CPU}s medição CPU)
+Envio ao S3: {"ATIVADO" if AWS_ENVIAR else "desativado"}
 
 {'=' * 100}
 ''')
 
-
 try:
+    for _ in psutil.process_iter(["cpu_percent"]):
+        pass
+
+    ultimo_upload = time.monotonic()
 
     while True:
-
-        # ==========================================================================
-        # TIMESTAMP
-        # ==========================================================================
-
-        timestamp = datetime.datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-
-        # ==========================================================================
-        # CPU
-        # ==========================================================================
-
-        # Talvez o Intervalo da CPU Gere uma distância maior entre os intervalos de Captura
-        cpu_percent = psutil.cpu_percent(interval=1)
-
-        cpu_freq = psutil.cpu_freq()    
-            
-        if cpu_freq:
-
-            cpu_freq_current = cpu_freq.current
-            cpu_freq_min = cpu_freq.min
-            cpu_freq_max = cpu_freq.max
-
-        else:
-
-            cpu_freq_current = None
-            cpu_freq_min = None
-            cpu_freq_max = None
-
-        cpu_times = psutil.cpu_times()
-
-
-        # ==========================================================================
-        # RAM
-        # ==========================================================================
-
-        memory = psutil.virtual_memory()
-
-
-        # ==========================================================================
-        # DISCO
-        # ==========================================================================
-
-        root_disk = psutil.disk_usage(
-            os.path.abspath(os.sep)
-        )
-
-
-        # ==========================================================================
-        # SWAP
-        # ==========================================================================
-
-        swap = psutil.swap_memory()
-
-
-        # ==========================================================================
-        # REDE
-        # ==========================================================================
-
-        network = psutil.net_io_counters()
-
-
-        # ==========================================================================
-        # I/O GLOBAL DE DISCO
-        # ==========================================================================
-
-        disk_io = psutil.disk_io_counters()
-
-        if disk_io is None:
-
-            disk_read_count = None
-            disk_write_count = None
-            disk_read_bytes = None
-            disk_write_bytes = None
-            disk_read_time = None
-            disk_write_time = None
-
-        else:
-
-            disk_read_count = disk_io.read_count
-            disk_write_count = disk_io.write_count
-            disk_read_bytes = disk_io.read_bytes
-            disk_write_bytes = disk_io.write_bytes
-            disk_read_time = disk_io.read_time
-            disk_write_time = disk_io.write_time
-
-
-        # ==========================================================================
-        # LOAD AVERAGE
-        # ==========================================================================
-
         try:
+            coletar_ciclo()
+        except Exception as erro:
+            print(f"[AVISO] Falha no ciclo de coleta: {erro}")
 
-            load_1m, load_5m, load_15m = psutil.getloadavg()
-
-        except (AttributeError, OSError):
-
-            load_1m = None
-            load_5m = None
-            load_15m = None
-
-        # ==========================================================================
-        # PROCESSOS
-        # ==========================================================================
-
-        linhas_processos = []
-        atributos = [
-            "pid", "name", "username", "status", "memory_info", "cpu_times",
-            "cpu_percent", "exe", "cmdline", "num_threads", "io_counters"
-        ]
-        process_count = len(psutil.pids())
-        for process in psutil.process_iter(attrs=atributos):
-            try:
-                info = process.info
-                memoria = info.get("memory_info")
-                tempos_cpu = info.get("cpu_times")
-                io = info.get("io_counters")
-                try:
-                    arquivos_abertos = len(process.open_files())
-                except (psutil.AccessDenied, psutil.NoSuchProcess, NotImplementedError, OSError):
-                    arquivos_abertos = None
-
-                linhas_processos.append([
-                    mach_uuid, timestamp, info.get("pid"),
-                    process.ppid(),
-                    info.get("name"),
-                    info.get("username"),
-                    info.get("status"),
-                    info.get("exe"),
-                    " ".join(info.get("cmdline") or []),
-                    process.create_time(), info.get("num_threads"),
-                    info.get("cpu_percent"),
-                    getattr(tempos_cpu, "user", None),
-                    getattr(memoria, "rss", None),
-                    getattr(memoria, "vms", None),
-                    process.memory_percent(),
-                    getattr(io, "read_count", None),
-                    getattr(io, "write_count", None),
-                    getattr(io, "read_bytes", None),
-                    getattr(io, "write_bytes", None),
-                    arquivos_abertos
-                ])
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-                # O processo pode encerrar ou ficar inacessível durante a coleta.
-                continue
-
-        gravar_csv(arquivo_processos, HEADER_PROCESSOS, linhas_processos)
-
-        # ==========================================================================
-        # CPU POR NÚCLEO LÓGICO
-        # ==========================================================================
-
-        linhas_cpu_nucleos = []
-        percentuais_cpu = psutil.cpu_percent(interval=None, percpu=True)
-        tempos_por_cpu = psutil.cpu_times(percpu=True)
-        try:
-            frequencias_por_cpu = psutil.cpu_freq(percpu=True) or []
-        except (AttributeError, OSError):
-            frequencias_por_cpu = []
-
-        for cpu_id, tempos in enumerate(tempos_por_cpu):
-            freq = frequencias_por_cpu[cpu_id] if cpu_id < len(frequencias_por_cpu) else None
-            linhas_cpu_nucleos.append([
-                mach_uuid, timestamp, cpu_id,
-                percentuais_cpu[cpu_id] if cpu_id < len(percentuais_cpu) else None,
-                getattr(tempos, "user", None), getattr(tempos, "system", None),
-                getattr(tempos, "idle", None), getattr(tempos, "nice", None),
-                getattr(tempos, "iowait", None), getattr(tempos, "irq", None),
-                getattr(tempos, "softirq", None),
-                getattr(freq, "current", None), getattr(freq, "min", None),
-                getattr(freq, "max", None)
-            ])
-
-        gravar_csv(arquivo_cpu_nucleos, HEADER_CPU_NUCLEOS, linhas_cpu_nucleos)
-
-        # ==========================================================================
-        # CONEXÕES DE REDE
-        # ==========================================================================
-
-        linhas_conexoes_rede = []
-        try:
-            conexoes = psutil.net_connections(kind="inet")
-            for conn in conexoes:
-                local_ip = conn.laddr.ip if conn.laddr else None
-                local_port = conn.laddr.port if conn.laddr else None
-                remote_ip = conn.raddr.ip if conn.raddr else None
-                remote_port = conn.raddr.port if conn.raddr else None
-                family = {getattr(__import__("socket"), "AF_INET", -1): "IPv4",
-                          getattr(__import__("socket"), "AF_INET6", -1): "IPv6"}.get(conn.family, str(conn.family))
-                tipo = {getattr(__import__("socket"), "SOCK_STREAM", -1): "TCP",
-                        getattr(__import__("socket"), "SOCK_DGRAM", -1): "UDP"}.get(conn.type, str(conn.type))
-                linhas_conexoes_rede.append([
-                    mach_uuid, timestamp, conn.pid, tipo, family,
-                    local_ip, local_port, remote_ip, remote_port, conn.status
-                ])
-        except (psutil.AccessDenied, OSError, NotImplementedError) as e:
-            print(f"Não foi possível listar todas as conexões de rede: {e}")
-
-        gravar_csv(arquivo_conexoes_rede, HEADER_CONEXOES_REDE, linhas_conexoes_rede)
-        # ==========================================================================
-        # MONTAGEM DOS DADOS
-        # ==========================================================================
-
-        DADOS_CENTRAL = [
-
-            # Identificação da recolha (2)
-            mach_uuid,
-            timestamp,
-
-            # Sistema (4)
-            platform.node(),
-            platform.system(),
-            platform.platform(),
-            psutil.boot_time(),
-
-            # CPU (8)
-            cpu_percent,
-            cpu_freq_current,
-            cpu_freq_min,
-            cpu_freq_max,
-            psutil.cpu_count(logical=True),
-            psutil.cpu_count(logical=False),
-            process_count,
-            psutil.cpu_count(logical=True),  # 14.º elemento (garante os 61 itens sem variáveis indefinidas)
-
-            # CPU Times (7)
-            getattr(cpu_times, "user", None),
-            getattr(cpu_times, "system", None),
-            getattr(cpu_times, "idle", None),
-            getattr(cpu_times, "nice", None),
-            getattr(cpu_times, "iowait", None),
-            getattr(cpu_times, "irq", None),
-            getattr(cpu_times, "softirq", None),
-
-            # RAM (11)
-            memory.total,
-            memory.available,
-            memory.used,
-            memory.free,
-            memory.percent,
-            getattr(memory, "active", None),
-            getattr(memory, "inactive", None),
-            getattr(memory, "buffers", None),
-            getattr(memory, "cached", None),
-            getattr(memory, "shared", None),
-            getattr(memory, "slab", None),
-
-            # Swap (6)
-            swap.total,
-            swap.used,
-            swap.free,
-            swap.percent,
-            swap.sin,
-            swap.sout,
-
-            # Load Average (3)
-            load_1m,
-            load_5m,
-            load_15m,
-
-            # Disco (4)
-            root_disk.total,
-            root_disk.used,
-            root_disk.free,
-            root_disk.percent,
-
-            # I/O global de disco (6)
-            disk_read_count,
-            disk_write_count,
-            disk_read_bytes,
-            disk_write_bytes,
-            disk_read_time,
-            disk_write_time,
-
-            # Rede (10)
-            network.bytes_sent,
-            network.bytes_recv,
-            network.packets_sent,
-            network.packets_recv,
-            network.errin,
-            network.errout,
-            network.dropin,
-            network.dropout,
-            getattr(network, "fifo_in", None),
-            getattr(network, "fifo_out", None),
-        ]
-
-        # Garante que colunas e valores têm a mesma dimensão (61 == 61)
-        assert len(DADOS_CENTRAL) == len(HEADER_CENTRAL), (
-            f"Colunas: {len(HEADER_CENTRAL)} | Valores: {len(DADOS_CENTRAL)}"
-        )
-
-
-        # ==========================================================================
-        # GRAVAÇÃO NO CSV
-        # ==========================================================================
-
-        arquivo_existe = os.path.exists(arquivo_csv)
-
-        arquivo_vazio = (
-            not arquivo_existe
-            or os.path.getsize(arquivo_csv) == 0
-        )
-
-
-        with open(
-            arquivo_csv,
-            "a",
-            newline="",
-            encoding="utf-8"
-        ) as csvfile:
-
-            writer = csv.writer(
-                csvfile,
-                delimiter=";"
-            )
-
-            # Cria o cabeçalho somente na primeira execução.
-            if arquivo_vazio:
-
-                writer.writerow(
-                    HEADER_CENTRAL
-                )
-
-            writer.writerow(
-                DADOS_CENTRAL
-            )
-
-
-        # ==========================================================================
-        # LOG DA COLETA
-        # ==========================================================================
-
-        print(
-            f"[{timestamp}] "
-            f"CPU={cpu_percent:.1f}% | "
-            f"RAM={memory.percent:.1f}% | "
-            f"Disco={root_disk.percent:.1f}% | "
-            f"Rede enviada={network.bytes_sent} bytes"
-        )
-
-
-        # ==========================================================================
-        # AGUARDA PRÓXIMA COLETA
-        # ==========================================================================
+        if AWS_ENVIAR and time.monotonic() - ultimo_upload >= INTERVALO_UPLOAD_S:
+            enviar_arquivos_s3([arquivo_sistema, arquivo_particoes, arquivo_processos, arquivo_conexoes_rede])
+            ultimo_upload = time.monotonic()
 
         time.sleep(INTERVALO_COLETA)
 
-
 except KeyboardInterrupt:
-
-    print(f'''
-    
-Interrompendo o programa...
-
-{'=' * 100}
-''')
-
+    if AWS_ENVIAR:
+        enviar_arquivos_s3([arquivo_sistema, arquivo_particoes, arquivo_processos, arquivo_conexoes_rede])
+    print(f"\nInterrompendo a captura...\n\n{'=' * 100}\n")
 
 except Exception as e:
-
-    print(str(e))
-
-    print(f'''
-    
-Ocorreu um erro inesperado, entre em contato com nossa equipe.
-
-[ CÓDIGO ERRO = {e.args} ]
-
-{'=' * 100}
-''')
+    print(f"\nErro inesperado na captura: [ CÓDIGO ERRO = {e.args} ]\n\n{'=' * 100}\n")
