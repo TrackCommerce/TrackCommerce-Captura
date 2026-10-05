@@ -26,9 +26,9 @@ except ImportError:
     boto3 = None
 
 
-# ==========================================================================================
-# CONFIGURAÇÕES
-# ==========================================================================================
+
+# configuração
+
 
 INTERVALO_COLETA = 1       # segundos de espera entre ciclos
 INTERVALO_CPU = 1          # segundos de medição do uso de CPU (bloqueante)
@@ -37,7 +37,7 @@ TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
 # Partições ignoradas no monitoramento
 FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"} # Partições não especificadas no arquivo de Capturas de Métricas e no Figma
 
-# Configurações AWS S3 (opcional) -- Posteriormente ajustado no .env (provavelmente)
+# Configurações AWS S3 (opcional) 
 AWS_ENVIAR = os.getenv("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
 AWS_BUCKET = os.getenv("AWS_BUCKET", "")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -48,9 +48,9 @@ AWS_PREFIXO = "track-commerce/bronze"
 INTERVALO_UPLOAD_S = int(os.getenv("INTERVALO_UPLOAD_S", "300"))
 
 
-# ==========================================================================================
-# DIRETÓRIO PADRÃO DA APLICAÇÃO
-# ==========================================================================================
+
+#diretório padrão da aplicação
+
 
 def diretorio_aplicacao():
     """Pasta onde a aplicação está (script .py ou executável empacotado)."""
@@ -65,9 +65,7 @@ DIR_BRONZE = os.path.join(DIR_APP, "track-commerce", "bronze")
 os.makedirs(DIR_BRONZE, exist_ok=True)
 
 
-# ==========================================================================================
-# BANNER
-# ==========================================================================================
+
 
 print(f'''
 {'=' * 100}
@@ -84,12 +82,11 @@ print(f'''
 print(f"Sistema: {platform.system()}")
 
 
-# ==========================================================================================
-# UUID / IDENTIFICADOR DA MÁQUINA
-# ==========================================================================================
+# UUID - identificador da máquina
+
 
 def get_machineUUID():
-    """Devolve um identificador estável da máquina (UUID de hardware ou machine-id)."""
+    """Devolve um identificador estável da máquina"""
     try:
         if sys.platform == "win32":
             try:
@@ -124,9 +121,8 @@ identificador_servidor = str(mach_uuid).replace("-", "_")
 print(f"UUID da Máquina: {mach_uuid}")
 
 
-# ==========================================================================================
-# CABEÇALHOS DOS CSVs (COMPLETO E SEM DUPLICAÇÕES)
-# ==========================================================================================
+# cabeçalhos do csv
+
 
 HEADER_SISTEMA = [
     # Identificação
@@ -199,9 +195,9 @@ def gravar_csv(caminho, cabecalho, linhas):
         writer.writerows(linhas)
 
 
-# ==========================================================================================
+
 # ENVIO OPCIONAL AO S3 (boto3)
-# ==========================================================================================
+
 
 _cliente_s3 = None
 _s3_desativado = False
@@ -251,9 +247,9 @@ def enviar_arquivos_s3(caminhos):
             print(f"[AVISO] Falha ao enviar {caminho} ao S3: {erro}")
 
 
-# ==========================================================================================
-# COLETAS DETALHADAS
-# ==========================================================================================
+
+# coletas detalhadas 
+
 
 def coletar_particoes(timestamp):
     linhas, vistos = [], set()
@@ -455,9 +451,7 @@ def coletar_ciclo():
           f"Disco Raiz={d_root_pct}% | Conexões={len(conexoes_detalhadas)} | Processos={len(processos)}")
 
 
-# ==========================================================================================
-# INÍCIO DA CAPTURA
-# ==========================================================================================
+# início captura
 
 print(f'''
 Iniciando Captura
