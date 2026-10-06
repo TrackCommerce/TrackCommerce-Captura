@@ -13,6 +13,13 @@ import sys
 import time
 import uuid
 
+# Importação do dotenv para carregamento de configurações do arquivo .env
+try:
+    from dotenv import dotenv_values, load_dotenv
+except ImportError as erro:
+    print(f"\n{'=' * 100}\nErro ao carregar a biblioteca python-dotenv: {erro}\nInstale com: pip install python-dotenv\n{'=' * 100}")
+    sys.exit(1)
+
 # Bibliotecas externas
 try:
     import psutil
@@ -61,11 +68,41 @@ def diretorio_aplicacao():
 
 DIR_APP = diretorio_aplicacao()
 os.chdir(DIR_APP)
+
+# Carrega as variáveis do arquivo .env localizado no diretório da aplicação
+caminho_env = os.path.join(DIR_APP, ".env")
+load_dotenv(dotenv_path=caminho_env)
+config = dotenv_values(caminho_env)
+
 DIR_BRONZE = os.path.join(DIR_APP, "track-commerce", "bronze")
 os.makedirs(DIR_BRONZE, exist_ok=True)
 
 
+# ==========================================================================================
+# CONFIGURAÇÕES
+# ==========================================================================================
 
+INTERVALO_COLETA = 1       # segundos de espera entre ciclos
+INTERVALO_CPU = 1          # segundos de medição do uso de CPU (bloqueante)
+TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
+
+# Partições ignoradas no monitoramento
+FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"}
+
+# Configurações AWS S3 via dotenv (com fallbacks padrão)
+AWS_ENVIAR = config.get("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
+AWS_BUCKET = config.get("AWS_BUCKET", "")
+AWS_REGION = config.get("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = config.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = config.get("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = config.get("AWS_SESSION_TOKEN", "")
+AWS_PREFIXO = "track-commerce/bronze"
+INTERVALO_UPLOAD_S = int(config.get("INTERVALO_UPLOAD_S", "300"))
+
+
+# ==========================================================================================
+# BANNER
+# ==========================================================================================
 
 print(f'''
 {'=' * 100}
@@ -146,7 +183,7 @@ HEADER_SISTEMA = [
     # Swap (bytes)
     "swap_total", "swap_used", "swap_free", "swap_percent", "swap_sin", "swap_sout",
 
-    # Disco Raiz (restaurado para cálculo correto no ETL)
+    # Disco Raiz
     "disk_root_total", "disk_root_used", "disk_root_free", "disk_root_percent",
 
     # I/O global de disco (contadores acumulados)
@@ -215,7 +252,7 @@ def obter_cliente_s3():
         _s3_desativado = True
         return None
     if not (AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
-        print("[AVISO] Bucket ou credenciais AWS ausentes. Envio ao S3 desativado.")
+        print("[AVISO] Bucket ou credenciais AWS ausentes no arquivo .env. Envio ao S3 desativado.")
         _s3_desativado = True
         return None
     try:
