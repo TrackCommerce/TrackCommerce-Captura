@@ -226,9 +226,9 @@ def estatisticas(valores):
     }
 
 
-# ==========================================================================================
-# LEITURA BRONZE
-# ==========================================================================================
+
+# leitura bronze
+
 
 def ler_bronze(caminho):
     if not os.path.isfile(caminho) or os.path.getsize(caminho) == 0:
@@ -282,9 +282,8 @@ def colunas_nucleos(linha):
     return [nucleos[i] for i in sorted(nucleos)]
 
 
-# ==========================================================================================
-# TRANSFORMAÇÃO
-# ==========================================================================================
+# transformação
+
 
 def delta(atual, anterior, coluna):
     a = para_positivo(atual.get(coluna))
@@ -385,7 +384,7 @@ def transformar_linha(linha, anterior, empresa):
         "swap_disponivel_gb": para_gb(swap_free),
         "swap_usada_gb": para_gb(swap_used),
 
-        # DISCO (Calculado diretamente das capturas de disco raiz + IOPS)
+        # DISCO 
         "disco_percent": arredondar(para_percentual(linha.get("disk_root_percent"))),
         "disco_total_gb": para_gb(para_positivo(linha.get("disk_root_total"))),
         "disco_usado_gb": para_gb(para_positivo(linha.get("disk_root_used"))),
@@ -430,9 +429,9 @@ def aplicar_desvio_movel(registros):
     return registros
 
 
-# ==========================================================================================
+
 # SILVER - CSV
-# ==========================================================================================
+
 
 def gravar_silver(pasta_empresa, identificador, registros):
     diretorio = os.path.join(DIR_SILVER, pasta_empresa)
@@ -449,9 +448,8 @@ def gravar_silver(pasta_empresa, identificador, registros):
     return caminho
 
 
-# ==========================================================================================
 # GOLD - JSON
-# ==========================================================================================
+
 
 def historico(registros, campos):
     serie = []
@@ -593,9 +591,9 @@ def ultimo_valido_bronze(linhas, *colunas):
     return None
 
 
-# ==========================================================================================
+
 # EXECUÇÃO
-# ==========================================================================================
+
 
 def main():
     # 1. Download do S3 se ativado
