@@ -5,12 +5,15 @@
 """
 import csv
 import datetime
+import json
 import os
 import platform
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 # Importação do dotenv para carregamento de configurações do arquivo .env
@@ -73,6 +76,9 @@ os.chdir(DIR_APP)
 caminho_env = os.path.join(DIR_APP, ".env")
 load_dotenv(dotenv_path=caminho_env)
 config = dotenv_values(caminho_env)
+
+TOKEN_INSTALACAO = config.get("TOKEN_INSTALACAO", "").strip()
+API_BASE_URL = config.get("API_BASE_URL", "http://localhost:3333").rstrip("/")
 
 DIR_BRONZE = os.path.join(DIR_APP, "track-commerce", "bronze")
 os.makedirs(DIR_BRONZE, exist_ok=True)
@@ -153,9 +159,48 @@ def get_machineUUID():
         return str(uuid.getnode())
 
 
+def ativar_agente(identificador):
+    """Cadastra ou reativa esta máquina antes de iniciar a coleta."""
+    if not TOKEN_INSTALACAO:
+        print("TOKEN_INSTALACAO não foi informado no arquivo .env.")
+        return None
+
+    dados = json.dumps({
+        "identificadorServidor": identificador,
+        "nomeServidor": platform.node() or f"Servidor {identificador[:12]}",
+        "sistemaOperacional": platform.system(),
+        "plataforma": platform.platform()
+    }).encode("utf-8")
+    requisicao = urllib.request.Request(
+        f"{API_BASE_URL}/agente/ativar",
+        data=dados,
+        headers={
+            "Authorization": f"Bearer {TOKEN_INSTALACAO}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(requisicao, timeout=15) as resposta:
+            retorno = json.loads(resposta.read().decode("utf-8"))
+            print(retorno.get("mensagem", "Agente ativado com sucesso."))
+            return retorno
+    except urllib.error.HTTPError as erro:
+        mensagem = erro.read().decode("utf-8", errors="replace")
+        print(f"Falha ao ativar agente (HTTP {erro.code}): {mensagem}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as erro:
+        print(f"Falha ao conectar com a API TrackCommerce: {erro}")
+    return None
+
+
 mach_uuid = get_machineUUID()
 identificador_servidor = str(mach_uuid).replace("-", "_")
 print(f"UUID da Máquina: {mach_uuid}")
+
+registro_agente = ativar_agente(str(mach_uuid))
+if registro_agente is None:
+    sys.exit(1)
 
 
 # cabeçalhos do csv
@@ -163,7 +208,8 @@ print(f"UUID da Máquina: {mach_uuid}")
 
 HEADER_SISTEMA = [
     # Identificação
-    "identifier", "timestamp", "hostname", "os", "platform", "boot_time",
+    "identifier", "enterprise_identifier", "enterprise_reason", "vm_nome",
+    "timestamp", "hostname", "os", "platform", "boot_time",
 
     # CPU
     "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
@@ -415,6 +461,9 @@ def coletar_ciclo():
 
     dados = {
         "identifier": mach_uuid,
+        "enterprise_identifier": registro_agente.get("id_empresa"),
+        "enterprise_reason": registro_agente.get("empresa"),
+        "vm_nome": platform.node(),
         "timestamp": timestamp,
         "hostname": platform.node(),
         "os": platform.system(),
