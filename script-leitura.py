@@ -51,39 +51,67 @@ COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
 
 # S3 Download / Upload (Opcional)
 AWS_BAIXAR = os.getenv("AWS_BAIXAR", "False").lower() in ("true", "1", "t", "yes")
+AWS_UPLOAD = os.getenv("AWS_UPLOAD", "False").lower() in ("true", "1", "t", "yes")
 AWS_BUCKET = os.getenv("AWS_BUCKET", "")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
-AWS_PREFIXO = "track-commerce/bronze"
+# AWS_PREFIXO = "track-commerce/bronze"
+AWS_PREFIXO_BRONZE = "track-commerce/bronze"
+AWS_PREFIXO_SILVER = "track-commerce/silver"
+AWS_PREFIXO_GOLD = "track-commerce/gold"
 
+def obter_cliente_s3():
+    if not (boto3 and AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+        return None
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        aws_session_token=AWS_SESSION_TOKEN or None,
+        region_name=AWS_REGION,
+    )
 
 def baixar_bronze_s3():
     """Baixa automaticamente os CSVs do S3 para a pasta local bronze antes do processamento."""
     if not (AWS_BAIXAR and boto3 and AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
         return
-    print("[S3 ETL] Iniciando busca por arquivos no Bucket S3...")
+
+    s3 = obter_cliente_s3()
+    if not s3:
+        print("[AVISO ETL] Configurações AWS incompletas para download.")
+        return
+
+    print("[S3 ETL] Iniciando busca por arquivos no Bucket S3 (Bronze)...")
     try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            aws_session_token=AWS_SESSION_TOKEN or None,
-            region_name=AWS_REGION,
-        )
         os.makedirs(DIR_BRONZE, exist_ok=True)
         paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=AWS_BUCKET, Prefix=AWS_PREFIXO):
+        for page in paginator.paginate(Bucket=AWS_BUCKET, Prefix=AWS_PREFIXO_BRONZE):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if key.endswith(".csv"):
                     nome_arquivo = os.path.basename(key)
                     destino = os.path.join(DIR_BRONZE, nome_arquivo)
                     s3.download_file(AWS_BUCKET, key, destino)
-                    print(f"  [S3 ETL] Baixado: {key} -> {destino}")
+                    print(f"  [S3 DOWNLOAD] Baixado: {key} -> {destino}")
     except Exception as erro:
-        print(f"  [AVISO ETL] Falha ao sincronizar com S3: {erro}")
+        print(f"  [ERRO S3 DOWNLOAD] Falha ao sincronizar com S3: {erro}")
+
+def enviar_para_s3(caminho_local, chave_s3):
+    """Faz o upload de um arquivo local para o bucket S3."""
+    if not AWS_UPLOAD:
+            return
+    
+    s3 = obter_cliente_s3()
+    if not s3:
+        return
+
+    try:
+        s3.upload_file(caminho_local, AWS_BUCKET, chave_s3)
+        print(f"  [S3 UPLOAD] Enviado: {chave_s3}")
+    except Exception as erro:
+        print(f"  [ERRO S3 UPLOAD] Falha ao enviar {caminho_local}: {erro}")
 
 
 def carregar_maquinas_bd():
@@ -660,13 +688,21 @@ def main():
         nome = nome_seguro(identificador)
         pasta_empresa = nome_seguro(empresa_id)
 
-        silver = gravar_silver(pasta_empresa, nome, registros)
+        caminho_silver = gravar_silver(pasta_empresa, nome, registros)
+
+        chave_s3_silver = f"{AWS_PREFIXO_SILVER}/{pasta_empresa}/{nome}_sistema.csv"
+        enviar_para_s3(caminho_silver, chave_s3_silver)
+
         gold = montar_gold(registros)
         dir_gold_empresa = os.path.join(DIR_GOLD, pasta_empresa)
         os.makedirs(dir_gold_empresa, exist_ok=True)
+
         caminho_gold = os.path.join(dir_gold_empresa, f"{nome}_sistema.json")
         with open(caminho_gold, "w", encoding="utf-8") as f:
             json.dump(gold, f, ensure_ascii=False, indent=2)
+
+        chave_s3_gold_maq = f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/{nome}_sistema.json"
+        enviar_para_s3(caminho_gold, chave_s3_gold_maq)
 
         grupo = indice.setdefault(pasta_empresa, {
             "empresa_id": empresa_id,
@@ -680,14 +716,23 @@ def main():
             "ram_percent": gold["ram"]["atual"]["uso_percent"],
             "disco_percent": gold["disco"]["atual"]["uso_percent"],
         })
-        print(f"  OK {identificador} ({empresa_nome}): {len(registros)} registros -> {silver} | {caminho_gold}")
+        print(f"  OK {identificador} ({empresa_nome}): {len(registros)} registros -> {caminho_silver} | {caminho_gold}")
 
     for pasta_empresa, grupo in indice.items():
-        with open(os.path.join(DIR_GOLD, pasta_empresa, "indice_maquinas.json"), "w", encoding="utf-8") as f:
+        caminho_indice_emp = os.path.join(DIR_GOLD, pasta_empresa, "indice_maquinas.json")
+
+        with open(caminho_indice_emp, "w", encoding="utf-8") as f:
             json.dump(grupo, f, ensure_ascii=False, indent=2)
 
-    with open(os.path.join(DIR_GOLD, "indice_maquinas.json"), "w", encoding="utf-8") as f:
+        chave_s3_indice_emp = f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/indice_maquinas.json"
+        enviar_para_s3(caminho_indice_emp, chave_s3_indice_emp) 
+
+    caminho_indice_global = os.path.join(DIR_GOLD, "indice_maquinas.json")
+    with open(caminho_indice_global, "w", encoding="utf-8") as f:
         json.dump({"empresas": list(indice.values())}, f, ensure_ascii=False, indent=2)
+
+    chave_s3_indice_global = f"{AWS_PREFIXO_GOLD}/indice_maquinas.json"
+    enviar_para_s3(caminho_indice_global, chave_s3_indice_global)
 
     total = sum(len(g["maquinas"]) for g in indice.values())
     print(f"Concluído: {total} máquina(s) de {len(indice)} empresa(s) processada(s).")
