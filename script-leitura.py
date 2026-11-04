@@ -1,6 +1,6 @@
 """
 ==========================================================================================
- TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD) - VERSÃO CORRIGIDA
+ TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD)
 ==========================================================================================
 
  Entrada : ./track-commerce/bronze/*.csv (ou via S3 Bucket)
