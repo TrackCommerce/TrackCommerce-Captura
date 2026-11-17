@@ -32,8 +32,23 @@ except ImportError as erro:
 
 try:
     import boto3
+    from botocore.utils import InstanceMetadataRegionFetcher
 except ImportError:
     boto3 = None
+    InstanceMetadataRegionFetcher = None
+
+
+def obter_regiao_instancia():
+    """Captura a região da instância via sessão boto3 ou metadados EC2 (IMDS)."""
+    if boto3 is None:
+        return None
+    try:
+        regiao = boto3.Session().region_name
+        if not regiao and InstanceMetadataRegionFetcher is not None:
+            regiao = InstanceMetadataRegionFetcher(timeout=1, num_attempts=1).retrieve_region()
+        return regiao or None
+    except Exception:
+        return None
 
 
 
@@ -96,9 +111,12 @@ TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
 FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"}
 
 # Configurações AWS S3 via dotenv (com fallbacks padrão)
+_regiao_detectada = obter_regiao_instancia()
+regiao_instancia = _regiao_detectada or "Desconhecida"
+
 AWS_ENVIAR = config.get("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
 AWS_BUCKET = config.get("AWS_BUCKET", "")
-AWS_REGION = config.get("AWS_REGION", "us-east-1")
+AWS_REGION = config.get("AWS_REGION") or os.getenv("AWS_REGION") or _regiao_detectada or "us-east-1"
 AWS_ACCESS_KEY_ID = config.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = config.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = config.get("AWS_SESSION_TOKEN", "")
@@ -123,6 +141,7 @@ print(f'''
 ''')
 
 print(f"Sistema: {platform.system()}")
+print(f"Região: {regiao_instancia}")
 
 
 # UUID - identificador da máquina
@@ -209,7 +228,7 @@ if registro_agente is None:
 HEADER_SISTEMA = [
     # Identificação
     "identifier", "enterprise_identifier", "enterprise_reason", "vm_nome",
-    "timestamp", "hostname", "os", "platform", "boot_time",
+    "timestamp", "hostname", "os", "platform", "region", "boot_time",
 
     # CPU
     "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
@@ -468,6 +487,7 @@ def coletar_ciclo():
         "hostname": platform.node(),
         "os": platform.system(),
         "platform": platform.platform(),
+        "region": regiao_instancia,
         "boot_time": psutil.boot_time(),
 
         "cpu_percent": cpu_percent,
