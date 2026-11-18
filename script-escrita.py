@@ -217,6 +217,15 @@ mach_uuid = get_machineUUID()
 identificador_servidor = str(mach_uuid).replace("-", "_")
 print(f"UUID da Máquina: {mach_uuid}")
 
+
+#Para testar localmente:
+#registro_agente = {
+ #   "id_empresa": 1,
+  #  "empresa": "Teste Local"
+#}
+
+
+#Para testar não localmente:
 registro_agente = ativar_agente(str(mach_uuid))
 if registro_agente is None:
     sys.exit(1)
@@ -256,11 +265,15 @@ HEADER_SISTEMA = [
     "disk_read_time", "disk_write_time",
 
     # Rede (contadores acumulados)
-    "network_bytes_sent", "network_bytes_recv", "network_packets_sent", "network_packets_recv",
-    "network_errin", "network_errout", "network_dropin", "network_dropout",
+    "network_bytes_sent", "network_bytes_recv","network_packets_sent", "network_packets_recv",
+    "network_errin", "network_errout",
+    "network_dropin", "network_dropout",
+
+    # Novas métricas de tráfego por minuto
+    "network_recv_mb_min", "network_sent_mb_min",
 
     # Conexões ativas agregadas por estado
-    "net_conn_total", "net_established", "net_time_wait", "net_close_wait", "net_none", "net_outros",
+    "net_conn_total", "net_established", "net_time_wait","net_close_wait", "net_none", "net_outros",
 ]
 
 HEADER_PARTICOES = [
@@ -438,7 +451,13 @@ def contar_conexoes_resumo():
     return {"total": total, **principais, "outros": total - sum(principais.values())}
 
 
+
+ultima_amostra_rede = None
+
+
 def coletar_ciclo():
+    global ultima_amostra_rede
+
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # CPU
@@ -454,12 +473,44 @@ def coletar_ciclo():
     # Disco Raiz
     try:
         root_disk = psutil.disk_usage(os.path.abspath(os.sep))
-        d_root_total, d_root_used, d_root_free, d_root_pct = root_disk.total, root_disk.used, root_disk.free, root_disk.percent
+        d_root_total, d_root_used, d_root_free, d_root_pct = (
+            root_disk.total, root_disk.used, root_disk.free, root_disk.percent
+        )
     except Exception:
         d_root_total = d_root_used = d_root_free = d_root_pct = None
 
     disk_io = psutil.disk_io_counters()
     rede = psutil.net_io_counters()
+
+    # NOVO: Cálculo do tráfego de rede em MB/min
+    agora_rede = time.monotonic()
+
+    network_recv_mb_min = None
+    network_sent_mb_min = None
+
+    if rede is not None:
+        if ultima_amostra_rede is not None:
+            anterior_t, anterior_recv, anterior_sent = ultima_amostra_rede
+
+            segundos = agora_rede - anterior_t
+
+            delta_recv = rede.bytes_recv - anterior_recv
+            delta_sent = rede.bytes_sent - anterior_sent
+
+            if segundos > 0 and delta_recv >= 0 and delta_sent >= 0:
+                network_recv_mb_min = round(
+                    delta_recv / (1024 ** 2) * 60 / segundos, 3
+                )
+
+                network_sent_mb_min = round(
+                    delta_sent / (1024 ** 2) * 60 / segundos, 3
+                )
+
+        ultima_amostra_rede = (
+            agora_rede,
+            rede.bytes_recv,
+            rede.bytes_sent
+        )
 
     # Load Average
     try:
@@ -469,7 +520,11 @@ def coletar_ciclo():
 
     # Contagem total de Threads
     try:
-        total_threads = sum(p.info["num_threads"] for p in psutil.process_iter(attrs=["num_threads"]) if p.info.get("num_threads"))
+        total_threads = sum(
+            p.info["num_threads"]
+            for p in psutil.process_iter(attrs=["num_threads"])
+            if p.info.get("num_threads")
+        )
     except Exception:
         total_threads = None
 
@@ -490,6 +545,7 @@ def coletar_ciclo():
         "region": regiao_instancia,
         "boot_time": psutil.boot_time(),
 
+        # CPU
         "cpu_percent": cpu_percent,
         "cpu_por_nucleo": "|".join(str(v) for v in por_nucleo),
         "cpu_freq_current": getattr(freq, "current", None),
@@ -500,6 +556,7 @@ def coletar_ciclo():
         "process_count": len(psutil.pids()),
         "thread_count": total_threads,
 
+        # CPU Times
         "cpu_user": getattr(tempos, "user", None),
         "cpu_system": getattr(tempos, "system", None),
         "cpu_idle": getattr(tempos, "idle", None),
@@ -509,8 +566,12 @@ def coletar_ciclo():
         "cpu_softirq": getattr(tempos, "softirq", None),
         "cpu_steal": getattr(tempos, "steal", None),
 
-        "load_1m": load_1m, "load_5m": load_5m, "load_15m": load_15m,
+        # Load Average
+        "load_1m": load_1m,
+        "load_5m": load_5m,
+        "load_15m": load_15m,
 
+        # RAM
         "ram_total": memoria.total,
         "ram_available": memoria.available,
         "ram_used": memoria.used,
@@ -523,14 +584,21 @@ def coletar_ciclo():
         "ram_shared": getattr(memoria, "shared", None),
         "ram_slab": getattr(memoria, "slab", None),
 
-        "swap_total": swap.total, "swap_used": swap.used, "swap_free": swap.free,
-        "swap_percent": swap.percent, "swap_sin": swap.sin, "swap_sout": swap.sout,
+        # Swap
+        "swap_total": swap.total,
+        "swap_used": swap.used,
+        "swap_free": swap.free,
+        "swap_percent": swap.percent,
+        "swap_sin": swap.sin,
+        "swap_sout": swap.sout,
 
+        # Disco Raiz
         "disk_root_total": d_root_total,
         "disk_root_used": d_root_used,
         "disk_root_free": d_root_free,
         "disk_root_percent": d_root_pct,
 
+        # I/O de Disco
         "disk_read_count": getattr(disk_io, "read_count", None),
         "disk_write_count": getattr(disk_io, "write_count", None),
         "disk_read_bytes": getattr(disk_io, "read_bytes", None),
@@ -538,23 +606,46 @@ def coletar_ciclo():
         "disk_read_time": getattr(disk_io, "read_time", None),
         "disk_write_time": getattr(disk_io, "write_time", None),
 
-        "network_bytes_sent": rede.bytes_sent, "network_bytes_recv": rede.bytes_recv,
-        "network_packets_sent": rede.packets_sent, "network_packets_recv": rede.packets_recv,
-        "network_errin": rede.errin, "network_errout": rede.errout,
-        "network_dropin": rede.dropin, "network_dropout": rede.dropout,
+        # Rede
+        "network_bytes_sent": rede.bytes_sent,
+        "network_bytes_recv": rede.bytes_recv,
+        "network_packets_sent": rede.packets_sent,
+        "network_packets_recv": rede.packets_recv,
+        "network_errin": rede.errin,
+        "network_errout": rede.errout,
+        "network_dropin": rede.dropin,
+        "network_dropout": rede.dropout,
 
-        "net_conn_total": conexoes_resumo["total"], "net_established": conexoes_resumo["established"],
-        "net_time_wait": conexoes_resumo["time_wait"], "net_close_wait": conexoes_resumo["close_wait"],
-        "net_none": conexoes_resumo["none"], "net_outros": conexoes_resumo["outros"],
+        # NOVO: Tráfego em MB/min
+        "network_recv_mb_min": network_recv_mb_min,
+        "network_sent_mb_min": network_sent_mb_min,
+
+        # Conexões ativas agregadas por estado
+        "net_conn_total": conexoes_resumo["total"],
+        "net_established": conexoes_resumo["established"],
+        "net_time_wait": conexoes_resumo["time_wait"],
+        "net_close_wait": conexoes_resumo["close_wait"],
+        "net_none": conexoes_resumo["none"],
+        "net_outros": conexoes_resumo["outros"],
     }
 
-    gravar_csv(arquivo_sistema, HEADER_SISTEMA, [[dados.get(c) for c in HEADER_SISTEMA]])
+    gravar_csv(
+        arquivo_sistema,
+        HEADER_SISTEMA,
+        [[dados.get(c) for c in HEADER_SISTEMA]]
+    )
+
     gravar_csv(arquivo_particoes, HEADER_PARTICOES, particoes)
     gravar_csv(arquivo_processos, HEADER_PROCESSOS, processos)
     gravar_csv(arquivo_conexoes_rede, HEADER_CONEXOES_REDE, conexoes_detalhadas)
 
-    print(f"[{timestamp}] CPU={cpu_percent}% | RAM={memoria.percent:.1f}% | "
-          f"Disco Raiz={d_root_pct}% | Conexões={len(conexoes_detalhadas)} | Processos={len(processos)}")
+    print(
+        f"[{timestamp}] CPU={cpu_percent}% | RAM={memoria.percent:.1f}% | "
+        f"Disco Raiz={d_root_pct}% | "
+        f"Conexões={len(conexoes_detalhadas)} | "
+        f"Processos={len(processos)}"
+    )
+
 
 
 # início captura
@@ -596,3 +687,6 @@ except KeyboardInterrupt:
 
 except Exception as e:
     print(f"\nErro inesperado na captura: [ CÓDIGO ERRO = {e.args} ]\n\n{'=' * 100}\n")
+
+
+    
