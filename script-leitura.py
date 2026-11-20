@@ -434,6 +434,135 @@ def transformar_dataframe(df_bronze, empresa):
 
     return out
 
+# CÁLCULOS DA DASHBOARD DE RAM (PANDAS)
+
+def calcular_proximo_pico(caminho_eventos=ARQUIVO_EVENTOS):
+    if not os.path.isfile(caminho_eventos):
+        return None
+    try:
+        with open(caminho_eventos, "r", encoding="utf-8") as f:
+            eventos = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    hoje = datetime.now().date()
+    dias_semana = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+    proximo = None
+
+    for ev in eventos:
+        try:
+            dt = datetime.strptime(ev["data"], "%Y-%m-%d").date()
+        except (KeyError, ValueError):
+            continue
+        diff = (dt - hoje).days
+        if diff >= 0 and (proximo is None or diff < proximo["dias_restantes"]):
+            proximo = {
+                "evento": ev["evento"],
+                "data": ev["data"],
+                "data_formatada": f"{dias_semana[dt.weekday()]} {dt.strftime('%d/%m')}",
+                "dias_restantes": diff,
+            }
+    return proximo
+
+
+def calcular_previsao_ram(df, janela=30):
+    sub = df[["timestamp", "ram_percent"]].tail(janela).copy()
+    sub["_ts"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub["ram_percent"] = pd.to_numeric(sub["ram_percent"], errors="coerce")
+    sub = sub.dropna(subset=["_ts", "ram_percent"])
+
+    if len(sub) < 2:
+        return {"minutos_ate_critico": None, "status": "estavel", "taxa_pct_por_hora": 0.0, "projecao_percent": None}
+
+    xs = (sub["_ts"] - sub["_ts"].iloc[0]).dt.total_seconds() / 60.0
+    ys = sub["ram_percent"]
+
+    den = ((xs - xs.mean()) ** 2).sum()
+    inclinacao = float(((xs - xs.mean()) * (ys - ys.mean())).sum() / den) if den > 0 else 0.0
+    atual = float(ys.iloc[-1])
+
+    if atual >= LIMITE_RAM_CRITICO:
+        return {"minutos_ate_critico": 0, "status": "critico", "taxa_pct_por_hora": round(inclinacao * 60, 2), "projecao_percent": atual}
+    if inclinacao <= 0.001:
+        return {"minutos_ate_critico": None, "status": "estavel", "taxa_pct_por_hora": round(inclinacao * 60, 2), "projecao_percent": atual}
+
+    minutos = (LIMITE_RAM_CRITICO - atual) / inclinacao
+    status = "critico" if minutos <= 30 else ("atencao" if minutos <= 60 else "seguro")
+    return {
+        "minutos_ate_critico": round(minutos),
+        "status": status,
+        "taxa_pct_por_hora": round(inclinacao * 60, 2),
+        "projecao_percent": LIMITE_RAM_CRITICO,
+    }
+
+
+def contar_alertas_ram_24h(df):
+    if df.empty:
+        return {"total": 0, "atencao": 0, "critico": 0}
+
+    sub = df[["timestamp", "ram_percent"]].copy()
+    sub["_ts"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub["ram_percent"] = pd.to_numeric(sub["ram_percent"], errors="coerce")
+    sub = sub.dropna(subset=["_ts", "ram_percent"])
+    if sub.empty:
+        return {"total": 0, "atencao": 0, "critico": 0}
+
+    limite_24h = sub["_ts"].max() - pd.Timedelta(hours=24)
+    sub = sub[sub["_ts"] >= limite_24h]
+
+    estados = pd.Series("normal", index=sub.index)
+    estados = estados.mask(sub["ram_percent"] >= LIMITE_RAM_ATENCAO, "atencao")
+    estados = estados.mask(sub["ram_percent"] >= LIMITE_RAM_CRITICO, "critico")
+
+    transicoes = estados[estados != estados.shift(1)]
+    atencao = int((transicoes == "atencao").sum())
+    critico = int((transicoes == "critico").sum())
+    return {"total": atencao + critico, "atencao": atencao, "critico": critico}
+
+
+def processar_processos_ram(caminhos_csv):
+    dfs = []
+    for caminho in caminhos_csv:
+        if os.path.isfile(caminho) and os.path.getsize(caminho) > 0:
+            try:
+                dfs.append(pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip"))
+            except Exception:
+                continue
+    if not dfs:
+        return {"maior_uso": [], "maior_crescimento": []}
+
+    df = pd.concat(dfs, ignore_index=True)
+    df["_ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["memory_rss_mb"] = pd.to_numeric(df["memory_rss_mb"], errors="coerce")
+    df["memory_percent"] = pd.to_numeric(df["memory_percent"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["pid", "_ts", "memory_rss_mb"]).sort_values("_ts")
+
+    if df.empty:
+        return {"maior_uso": [], "maior_crescimento": []}
+
+    ultimo_ts = df["_ts"].max()
+    agrupado = df.groupby("pid").agg(
+        processo=("name", "last"),
+        ts_ini=("_ts", "first"),
+        ts_fim=("_ts", "last"),
+        rss_ini=("memory_rss_mb", "first"),
+        rss_fim=("memory_rss_mb", "last"),
+        ram_percent=("memory_percent", "last"),
+    ).reset_index()
+
+    agrupado = agrupado[(ultimo_ts - agrupado["ts_fim"]).dt.total_seconds() <= 60]
+    horas = (agrupado["ts_fim"] - agrupado["ts_ini"]).dt.total_seconds() / 3600.0
+    agrupado["tendencia_mb_h"] = ((agrupado["rss_fim"] - agrupado["rss_ini"]) / horas).where(horas > 0.001, 0.0).round(1)
+    agrupado["ram_mb"] = agrupado["rss_fim"].round(1)
+    agrupado["ram_percent"] = agrupado["ram_percent"].round(1)
+    agrupado["pid"] = agrupado["pid"].astype(str)
+
+    cols = ["pid", "processo", "ram_mb", "ram_percent", "tendencia_mb_h"]
+    return {
+        "maior_uso": agrupado.nlargest(5, "ram_mb")[cols].to_dict(orient="records"),
+        "maior_crescimento": agrupado.nlargest(5, "tendencia_mb_h")[cols].to_dict(orient="records"),
+    }
+
 
 # SILVER (CSV) E GOLD (JSON)
 
