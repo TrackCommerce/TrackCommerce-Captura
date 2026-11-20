@@ -12,19 +12,18 @@
      ./track-commerce/gold/<empresa_id>/indice_maquinas.json
      ./track-commerce/gold/indice_maquinas.json
 
- Usa biblioteca padrão do Python + mysql.connector (opcional BD) + boto3 (opcional S3).
+Usa pandas + python-dotenv + mysql.connector (opcional BD) + boto3 (opcional S3).
 ==========================================================================================
 """
 
-import csv
 import glob
 import json
-import math
 import os
-import statistics
-from collections import deque
 from datetime import datetime
+
+
 import mysql.connector
+import pandas as pd
 from dotenv import load_dotenv
 
 try:
@@ -41,11 +40,16 @@ DIR_BASE = "./track-commerce"
 DIR_BRONZE = os.path.join(DIR_BASE, "bronze")
 DIR_SILVER = os.path.join(DIR_BASE, "silver")
 DIR_GOLD = os.path.join(DIR_BASE, "gold")
+ARQUIVO_EVENTOS = os.path.join(DIR_BASE, "eventos.json")
 
 DELIMITADOR_SAIDA = ";"
 FORMATO_TIMESTAMP = "%Y-%m-%d %H:%M:%S"
 JANELA_DESVIO = 60
 BYTES_POR_GB = 1024 ** 3
+BYTES_POR_MB = 1024 ** 2
+
+LIMITE_RAM_ATENCAO = 70.0
+LIMITE_RAM_CRITICO = 85.0
 
 COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
 
@@ -61,6 +65,16 @@ AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
 AWS_PREFIXO_BRONZE = "track-commerce/bronze"
 AWS_PREFIXO_SILVER = "track-commerce/silver"
 AWS_PREFIXO_GOLD = "track-commerce/gold"
+
+METRICAS_DESVIO = [
+    "cpu_percent", "load_1m", "cpu_iowait_pct",
+    "ram_percent", "swap_percent",
+    "disco_percent", "disco_leitura_bytes_s", "disco_escrita_bytes_s",
+    "disco_iops_total", "disco_latencia_ms",
+    "rede_upload_bytes_s", "rede_download_bytes_s", "rede_perda_pacotes_pct",
+]
+
+# AWS S3 E BANCO DE DADOS
 
 def obter_cliente_s3():
     if not (boto3 and AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
@@ -144,364 +158,315 @@ def carregar_maquinas_bd():
     finally:
         conexao.close()
 
-
-def normalizar_identificador(valor):
-    return para_texto(valor).lower().replace("-", "").replace("_", "") if valor else ""
-
-
-# ==========================================================================================
-# UTILITÁRIOS
-# ==========================================================================================
-
-def para_float(valor):
-    if valor is None:
-        return None
-    texto = str(valor).strip().replace(",", ".")
-    if texto == "" or texto.lower() in ("none", "nan", "null"):
-        return None
-    if texto.lower() == "true":
-        return 1.0
-    if texto.lower() == "false":
-        return 0.0
-    try:
-        numero = float(texto)
-    except ValueError:
-        return None
-    if math.isnan(numero) or math.isinf(numero):
-        return None
-    return numero
-
-
-def para_percentual(valor):
-    numero = para_float(valor)
-    return numero if numero is not None and 0 <= numero <= 100 else None
-
-
-def para_positivo(valor):
-    numero = para_float(valor)
-    return numero if numero is not None and numero >= 0 else None
-
+# UTILITÁRIOS PANDAS / JSON
 
 def para_texto(valor):
-    if valor is None:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return None
     texto = str(valor).strip()
     return texto if texto and texto.lower() not in ("none", "null", "nan") else None
 
 
-def arredondar(valor, casas=2):
-    return None if valor is None else round(valor, casas)
+def normalizar_identificador(valor):
+    texto = para_texto(valor)
+    return texto.lower().replace("-", "").replace("_", "") if texto else ""
+
+def nome_seguro(texto):
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(texto))[:120]
 
 
-def para_gb(valor_bytes):
-    return None if valor_bytes is None else round(valor_bytes / BYTES_POR_GB, 3)
+def col_num(df, coluna):
+    """Retorna uma Series numérica (float) para a coluna, ou NaNs se não existir."""
+    if coluna not in df.columns:
+        return pd.Series(float("nan"), index=df.index, dtype="float64")
+    return pd.to_numeric(df[coluna].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
 
-def dividir(a, b):
-    if a is None or b is None or b == 0:
-        return None
-    return a / b
+def col_pos(df, coluna):
+    s = col_num(df, coluna)
+    return s.where(s >= 0)
 
 
-def somar(*valores):
-    validos = [v for v in valores if v is not None]
-    return sum(validos) if validos else None
+def col_pct(df, coluna):
+    s = col_num(df, coluna)
+    return s.where((s >= 0) & (s <= 100))
 
 
-def ler_timestamp(texto):
-    texto = para_texto(texto)
+def delta_pos(serie):
+    d = serie.diff()
+    return d.where(d >= 0)
+
+
+def parse_nucleos(valor):
+    texto = para_texto(valor)
     if not texto:
-        return None
-    for formato in (FORMATO_TIMESTAMP, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        return []
+    res = []
+    for p in texto.split("|"):
         try:
-            return datetime.strptime(texto, formato)
+            v = float(p.strip().replace(",", "."))
+            if 0 <= v <= 100:
+                res.append(round(v, 2))
         except ValueError:
             continue
+    return res
+
+
+def limpar_valor_json(v):
+    """Converte tipos NumPy/Pandas e NaNs para tipos nativos do Python."""
+    if isinstance(v, list):
+        return [limpar_valor_json(x) for x in v]
+    if v is None or pd.isna(v):
+        return None
+    if hasattr(v, "item"):
+        return v.item()
+    return v
+
+
+def ultimo_valido(df, coluna):
+    if coluna not in df.columns:
+        return None
+    for v in reversed(df[coluna].tolist()):
+        if isinstance(v, list):
+            if v:
+                return v
+        elif v is not None and not pd.isna(v):
+            return limpar_valor_json(v)
     return None
 
 
-def desvio(valores):
-    limpos = [v for v in valores if v is not None]
-    if len(limpos) < 2:
-        return None
-    return round(statistics.pstdev(limpos), 3)
+def ultimo_valido_bronze(df, *colunas):
+    for col in colunas:
+        if col in df.columns:
+            validos = df[col].dropna().astype(str).str.strip()
+            validos = validos[~validos.str.lower().isin(["", "none", "null", "nan"])]
+            if not validos.empty:
+                return validos.iloc[-1]
+    return None
 
 
-def percentil(valores, p):
-    if not valores:
-        return None
-    ordenados = sorted(valores)
-    pos = (len(ordenados) - 1) * (p / 100)
-    inf, sup = math.floor(pos), math.ceil(pos)
-    return ordenados[inf] if inf == sup else ordenados[inf] * (sup - pos) + ordenados[sup] * (pos - inf)
-
-
-def estatisticas(valores):
-    limpos = [v for v in valores if v is not None]
-    if not limpos:
-        return {"amostras": 0, "min": None, "media": None, "mediana": None,
-                "p95": None, "max": None, "desvio_padrao": None,
-                f"desvio_padrao_ultimos_{JANELA_DESVIO}": None}
+def estatisticas_serie(serie):
+    s = pd.to_numeric(serie, errors="coerce").dropna()
+    if s.empty:
+        return {
+            "amostras": 0, "min": None, "media": None, "mediana": None,
+            "p95": None, "max": None, "desvio_padrao": None,
+            f"desvio_padrao_ultimos_{JANELA_DESVIO}": None,
+        }
+    ultimos = s.tail(JANELA_DESVIO)
     return {
-        "amostras": len(limpos),
-        "min": arredondar(min(limpos)),
-        "media": arredondar(statistics.fmean(limpos)),
-        "mediana": arredondar(statistics.median(limpos)),
-        "p95": arredondar(percentil(limpos, 95)),
-        "max": arredondar(max(limpos)),
-        "desvio_padrao": desvio(limpos),
-        f"desvio_padrao_ultimos_{JANELA_DESVIO}": desvio(limpos[-JANELA_DESVIO:]),
+        "amostras": int(len(s)),
+        "min": round(float(s.min()), 2),
+        "media": round(float(s.mean()), 2),
+        "mediana": round(float(s.median()), 2),
+        "p95": round(float(s.quantile(0.95)), 2),
+        "max": round(float(s.max()), 2),
+        "desvio_padrao": round(float(s.std(ddof=0)), 3) if len(s) >= 2 else None,
+        f"desvio_padrao_ultimos_{JANELA_DESVIO}": round(float(ultimos.std(ddof=0)), 3) if len(ultimos) >= 2 else None,
     }
 
-
-
-# leitura bronze
-
+# LEITURA BRONZE (PANDAS)
 
 def ler_bronze(caminho):
     if not os.path.isfile(caminho) or os.path.getsize(caminho) == 0:
-        return []
+        return pd.DataFrame()
     try:
-        with open(caminho, "r", newline="", encoding="utf-8", errors="ignore") as f:
-            amostra = f.read(4096)
-            f.seek(0)
-            try:
-                delimitador = csv.Sniffer().sniff(amostra, delimiters=";,\t|").delimiter
-            except csv.Error:
-                delimitador = ";"
-            leitor = csv.DictReader(f, delimiter=delimitador)
-            cabecalho = [c.strip() for c in (leitor.fieldnames or [])]
-            if any(c not in cabecalho for c in COLUNAS_OBRIGATORIAS):
-                return []
-            linhas = []
-            for bruta in leitor:
-                linha = {(k or "").strip(): v for k, v in bruta.items() if k}
-                ts = ler_timestamp(linha.get("timestamp"))
-                if ts is None or not para_texto(linha.get("identifier")):
-                    continue
-                linha["_ts"] = ts
-                linhas.append(linha)
-    except (OSError, csv.Error):
-        return []
+        df = pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
+    except Exception:
+        return pd.DataFrame()
 
-    linhas.sort(key=lambda l: l["_ts"])
-    unicas, vistos = [], set()
-    for linha in linhas:
-        chave = (linha.get("identifier"), linha["_ts"])
-        if chave not in vistos:
-            vistos.add(chave)
-            unicas.append(linha)
-    return unicas
+    df.columns = [c.strip() for c in df.columns]
+    if any(c not in df.columns for c in COLUNAS_OBRIGATORIAS):
+        return pd.DataFrame()
+
+    df["_ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["identifier", "_ts"])
+    df = df.sort_values("_ts").drop_duplicates(subset=["identifier", "_ts"], keep="last")
+    return df.reset_index(drop=True)
 
 
-def colunas_nucleos(linha):
-    texto_nucleos = para_texto(linha.get("cpu_por_nucleo"))
-    if texto_nucleos:
-        partes = texto_nucleos.split("|")
-        res = [para_percentual(p) for p in partes if para_percentual(p) is not None]
-        if res:
-            return res
-    nucleos = {}
-    for chave, valor in linha.items():
-        if chave.startswith("cpu_core_"):
-            sufixo = chave.replace("cpu_core_", "")
-            if sufixo.isdigit():
-                nucleos[int(sufixo)] = para_percentual(valor)
-    return [nucleos[i] for i in sorted(nucleos)]
+# TRANSFORMAÇÃO VETORIZADA (PANDAS)
 
+def transformar_dataframe(df_bronze, empresa):
+    df = df_bronze.sort_values("_ts").drop_duplicates(subset=["identifier", "_ts"], keep="last").reset_index(drop=True)
 
-# transformação
-
-
-def delta(atual, anterior, coluna):
-    a = para_positivo(atual.get(coluna))
-    b = para_positivo(anterior.get(coluna)) if anterior else None
-    if a is None or b is None:
-        return None
-    d = a - b
-    return d if d >= 0 else None
-
-
-def transformar_linha(linha, anterior, empresa):
-    ts = linha["_ts"]
-    intervalo = (ts - anterior["_ts"]).total_seconds() if anterior else None
-    if intervalo is not None and intervalo <= 0:
-        intervalo = None
+    intervalo = df["_ts"].diff().dt.total_seconds()
+    intervalo = intervalo.where(intervalo > 0)
 
     def taxa(coluna):
-        return arredondar(dividir(delta(linha, anterior, coluna), intervalo))
+        return (delta_pos(col_pos(df, coluna)) / intervalo).round(2)
 
+    # CPU modos
     modos = ["cpu_user", "cpu_system", "cpu_nice", "cpu_idle", "cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal"]
-    deltas_modos = {m: delta(linha, anterior, m) for m in modos}
-    total_modos = somar(*deltas_modos.values())
-    pct_modo = {m: arredondar(dividir(d, total_modos) * 100) if dividir(d, total_modos) is not None else None
-                for m, d in deltas_modos.items()}
+    deltas_modos = pd.DataFrame({m: delta_pos(col_pos(df, m)) for m in modos})
+    total_modos = deltas_modos.sum(axis=1, min_count=1).replace(0, float("nan"))
 
-    nucleos_logicos = para_positivo(linha.get("cpu_count_logical"))
-    load_1m = para_positivo(linha.get("load_1m"))
+    nucleos_logicos = col_pos(df, "cpu_count_logical")
+    load_1m = col_pos(df, "load_1m")
 
-    ram_total = para_positivo(linha.get("ram_total"))
-    ram_used = para_positivo(linha.get("ram_used"))
-    ram_avail = para_positivo(linha.get("ram_available"))
-    ram_buffers = para_positivo(linha.get("ram_buffers"))
-    ram_cached = para_positivo(linha.get("ram_cached"))
-    ram_slab = para_positivo(linha.get("ram_slab"))
-    buff_cache = somar(ram_buffers, ram_cached, ram_slab)
+    # RAM
+    ram_total = col_pos(df, "ram_total")
+    ram_used = col_pos(df, "ram_used")
+    ram_avail = col_pos(df, "ram_available")
+    ram_buffers = col_pos(df, "ram_buffers")
+    ram_cached = col_pos(df, "ram_cached")
+    ram_slab = col_pos(df, "ram_slab")
+    buff_cache = pd.DataFrame({"b": ram_buffers, "c": ram_cached, "s": ram_slab}).sum(axis=1, min_count=1)
 
-    swap_total = para_positivo(linha.get("swap_total"))
-    swap_used = para_positivo(linha.get("swap_used"))
-    swap_free = para_positivo(linha.get("swap_free"))
+    # Swap
+    swap_total = col_pos(df, "swap_total")
+    swap_used = col_pos(df, "swap_used")
+    swap_free = col_pos(df, "swap_free")
+    swap_sin_mb_s = ((delta_pos(col_pos(df, "swap_sin")) / BYTES_POR_MB) / intervalo).round(2)
+    swap_sout_mb_s = ((delta_pos(col_pos(df, "swap_sout")) / BYTES_POR_MB) / intervalo).round(2)
 
-    d_leituras = delta(linha, anterior, "disk_read_count")
-    d_escritas = delta(linha, anterior, "disk_write_count")
-    d_t_leitura = delta(linha, anterior, "disk_read_time")
-    d_t_escrita = delta(linha, anterior, "disk_write_time")
+    # Disco
+    d_leituras = delta_pos(col_pos(df, "disk_read_count"))
+    d_escritas = delta_pos(col_pos(df, "disk_write_count"))
+    d_t_leitura = delta_pos(col_pos(df, "disk_read_time"))
+    d_t_escrita = delta_pos(col_pos(df, "disk_write_time"))
+    d_io_total = pd.DataFrame({"r": d_leituras, "w": d_escritas}).sum(axis=1, min_count=1)
+    d_t_total = pd.DataFrame({"r": d_t_leitura, "w": d_t_escrita}).sum(axis=1, min_count=1)
 
-    lat_leitura = arredondar(dividir(d_t_leitura, d_leituras), 3)
-    lat_escrita = arredondar(dividir(d_t_escrita, d_escritas), 3)
-    lat_total = arredondar(dividir(somar(d_t_leitura, d_t_escrita), somar(d_leituras, d_escritas)), 3)
+    # Rede
+    d_pac = pd.DataFrame({
+        "s": delta_pos(col_pos(df, "network_packets_sent")),
+        "r": delta_pos(col_pos(df, "network_packets_recv")),
+    }).sum(axis=1, min_count=1)
+    d_drop = pd.DataFrame({
+        "i": delta_pos(col_pos(df, "network_dropin")),
+        "o": delta_pos(col_pos(df, "network_dropout")),
+    }).sum(axis=1, min_count=1)
+    d_err = pd.DataFrame({
+        "i": delta_pos(col_pos(df, "network_errin")),
+        "o": delta_pos(col_pos(df, "network_errout")),
+    }).sum(axis=1, min_count=1)
+    perda_pct = ((d_drop / (d_pac + d_drop).replace(0, float("nan"))) * 100).round(3)
 
-    d_pac = somar(delta(linha, anterior, "network_packets_sent"), delta(linha, anterior, "network_packets_recv"))
-    d_drop = somar(delta(linha, anterior, "network_dropin"), delta(linha, anterior, "network_dropout"))
-    perda_pct = round(d_drop / (d_pac + d_drop) * 100, 3) if d_drop is not None and d_pac is not None and (d_pac + d_drop) > 0 else None
+    # CPU por núcleo
+    if "cpu_por_nucleo" in df.columns:
+        cpu_nucleos_series = df["cpu_por_nucleo"].apply(parse_nucleos)
+    else:
+        cpu_nucleos_series = pd.Series([[] for _ in range(len(df))], index=df.index)
 
-    return {
-        # Empresa é obrigatoriamente mantida em cada registro
+    out = pd.DataFrame({
         "empresa_id": empresa["empresa_id"],
         "empresa_nome": empresa["empresa_nome"],
-        "identifier": para_texto(linha.get("identifier")),
+        "identifier": df["identifier"].apply(para_texto),
         "vm_nome": empresa.get("vm_nome"),
-        "hostname": para_texto(linha.get("hostname")),
-        "os": para_texto(linha.get("os")),
-        "timestamp": ts.strftime(FORMATO_TIMESTAMP),
-        "intervalo_segundos": arredondar(intervalo, 3),
+        "hostname": df["hostname"].apply(para_texto) if "hostname" in df.columns else None,
+        "os": df["os"].apply(para_texto) if "os" in df.columns else None,
+        "timestamp": df["_ts"].dt.strftime(FORMATO_TIMESTAMP),
+        "intervalo_segundos": intervalo.round(3),
 
         # CPU
-        "cpu_percent": arredondar(para_percentual(linha.get("cpu_percent"))),
-        "cpu_freq_mhz": arredondar(para_positivo(linha.get("cpu_freq_current"))),
+        "cpu_percent": col_pct(df, "cpu_percent").round(2),
+        "cpu_freq_mhz": col_pos(df, "cpu_freq_current").round(2),
         "cpu_nucleos_logicos": nucleos_logicos,
-        "cpu_nucleos_fisicos": para_positivo(linha.get("cpu_count_physical")),
-        "cpu_por_nucleo": colunas_nucleos(linha),
-        "load_1m": arredondar(load_1m, 3),
-        "load_5m": arredondar(para_positivo(linha.get("load_5m")), 3),
-        "load_15m": arredondar(para_positivo(linha.get("load_15m")), 3),
-        "load_por_nucleo": arredondar(dividir(load_1m, nucleos_logicos), 3),
-        "cpu_user_pct": pct_modo["cpu_user"],
-        "cpu_sys_pct": pct_modo["cpu_system"],
-        "cpu_nice_pct": pct_modo["cpu_nice"],
-        "cpu_idle_pct": pct_modo["cpu_idle"],
-        "cpu_iowait_pct": pct_modo["cpu_iowait"],
-        "qtd_processos": para_positivo(linha.get("process_count")),
-        "qtd_threads": para_positivo(linha.get("thread_count")),
+        "cpu_nucleos_fisicos": col_pos(df, "cpu_count_physical"),
+        "cpu_por_nucleo": cpu_nucleos_series,
+        "load_1m": load_1m.round(3),
+        "load_5m": col_pos(df, "load_5m").round(3),
+        "load_15m": col_pos(df, "load_15m").round(3),
+        "load_por_nucleo": (load_1m / nucleos_logicos.replace(0, float("nan"))).round(3),
+        "cpu_user_pct": ((deltas_modos["cpu_user"] / total_modos) * 100).round(2),
+        "cpu_sys_pct": ((deltas_modos["cpu_system"] / total_modos) * 100).round(2),
+        "cpu_nice_pct": ((deltas_modos["cpu_nice"] / total_modos) * 100).round(2),
+        "cpu_idle_pct": ((deltas_modos["cpu_idle"] / total_modos) * 100).round(2),
+        "cpu_iowait_pct": ((deltas_modos["cpu_iowait"] / total_modos) * 100).round(2),
+        "qtd_processos": col_pos(df, "process_count"),
+        "qtd_threads": col_pos(df, "thread_count"),
 
         # RAM
-        "ram_percent": arredondar(para_percentual(linha.get("ram_percent"))),
-        "ram_total_gb": para_gb(ram_total),
-        "ram_disponivel_gb": para_gb(ram_avail),
-        "ram_usada_gb": para_gb(ram_used),
-        "ram_cached_gb": para_gb(ram_cached),
-        "ram_buffers_gb": para_gb(ram_buffers),
-        "ram_shared_gb": para_gb(para_positivo(linha.get("ram_shared"))),
-        "ram_slab_gb": para_gb(ram_slab),
-        "ram_buff_cache_usado_gb": para_gb(buff_cache),
-        "ram_buff_cache_total_gb": para_gb(ram_total),
+        "ram_percent": col_pct(df, "ram_percent").round(2),
+        "ram_total_gb": (ram_total / BYTES_POR_GB).round(3),
+        "ram_disponivel_gb": (ram_avail / BYTES_POR_GB).round(3),
+        "ram_usada_gb": (ram_used / BYTES_POR_GB).round(3),
+        "ram_cached_gb": (ram_cached / BYTES_POR_GB).round(3),
+        "ram_buffers_gb": (ram_buffers / BYTES_POR_GB).round(3),
+        "ram_shared_gb": (col_pos(df, "ram_shared") / BYTES_POR_GB).round(3),
+        "ram_slab_gb": (ram_slab / BYTES_POR_GB).round(3),
+        "ram_buff_cache_usado_gb": (buff_cache / BYTES_POR_GB).round(3),
+        "ram_buff_cache_total_gb": (ram_total / BYTES_POR_GB).round(3),
 
         # SWAP
-        "swap_percent": arredondar(para_percentual(linha.get("swap_percent"))),
-        "swap_total_gb": para_gb(swap_total),
-        "swap_disponivel_gb": para_gb(swap_free),
-        "swap_usada_gb": para_gb(swap_used),
+        "swap_percent": col_pct(df, "swap_percent").round(2),
+        "swap_total_gb": (swap_total / BYTES_POR_GB).round(3),
+        "swap_disponivel_gb": (swap_free / BYTES_POR_GB).round(3),
+        "swap_usada_gb": (swap_used / BYTES_POR_GB).round(3),
+        "swap_sin_mb_s": swap_sin_mb_s,
+        "swap_sout_mb_s": swap_sout_mb_s,
 
-        # DISCO 
-        "disco_percent": arredondar(para_percentual(linha.get("disk_root_percent"))),
-        "disco_total_gb": para_gb(para_positivo(linha.get("disk_root_total"))),
-        "disco_usado_gb": para_gb(para_positivo(linha.get("disk_root_used"))),
-        "disco_livre_gb": para_gb(para_positivo(linha.get("disk_root_free"))),
+        # DISCO
+        "disco_percent": col_pct(df, "disk_root_percent").round(2),
+        "disco_total_gb": (col_pos(df, "disk_root_total") / BYTES_POR_GB).round(3),
+        "disco_usado_gb": (col_pos(df, "disk_root_used") / BYTES_POR_GB).round(3),
+        "disco_livre_gb": (col_pos(df, "disk_root_free") / BYTES_POR_GB).round(3),
         "disco_leitura_bytes_s": taxa("disk_read_bytes"),
         "disco_escrita_bytes_s": taxa("disk_write_bytes"),
         "disco_iops_leitura": taxa("disk_read_count"),
         "disco_iops_escrita": taxa("disk_write_count"),
-        "disco_iops_total": arredondar(dividir(somar(d_leituras, d_escritas), intervalo)),
-        "disco_latencia_leitura_ms": lat_leitura,
-        "disco_latencia_escrita_ms": lat_escrita,
-        "disco_latencia_ms": lat_total,
+        "disco_iops_total": (d_io_total / intervalo).round(2),
+        "disco_latencia_leitura_ms": (d_t_leitura / d_leituras.replace(0, float("nan"))).round(3),
+        "disco_latencia_escrita_ms": (d_t_escrita / d_escritas.replace(0, float("nan"))).round(3),
+        "disco_latencia_ms": (d_t_total / d_io_total.replace(0, float("nan"))).round(3),
 
         # REDE
         "rede_upload_bytes_s": taxa("network_bytes_sent"),
         "rede_download_bytes_s": taxa("network_bytes_recv"),
         "rede_perda_pacotes_pct": perda_pct,
-        "rede_erros_s": arredondar(dividir(somar(delta(linha, anterior, "network_errin"),
-                                                 delta(linha, anterior, "network_errout")), intervalo)),
-        "rede_established": para_positivo(linha.get("net_established")),
-        "rede_time_wait": para_positivo(linha.get("net_time_wait")),
-        "rede_close_wait": para_positivo(linha.get("net_close_wait")),
-        "rede_conn_total": para_positivo(linha.get("net_conn_total")),
-    }
+        "rede_erros_s": (d_err / intervalo).round(2),
+        "rede_established": col_pos(df, "net_established"),
+        "rede_time_wait": col_pos(df, "net_time_wait"),
+        "rede_close_wait": col_pos(df, "net_close_wait"),
+        "rede_conn_total": col_pos(df, "net_conn_total"),
+    })
+
+    # Desvio padrão móvel vetorizado
+    for m in METRICAS_DESVIO:
+        if m in out.columns:
+            out[f"{m}_dp{JANELA_DESVIO}"] = (
+                pd.to_numeric(out[m], errors="coerce")
+                .rolling(window=JANELA_DESVIO, min_periods=2)
+                .std(ddof=0)
+                .round(3)
+            )
+
+    return out
 
 
-METRICAS_DESVIO = [
-    "cpu_percent", "load_1m", "cpu_iowait_pct",
-    "ram_percent", "swap_percent",
-    "disco_percent", "disco_leitura_bytes_s", "disco_escrita_bytes_s",
-    "disco_iops_total", "disco_latencia_ms",
-    "rede_upload_bytes_s", "rede_download_bytes_s", "rede_perda_pacotes_pct",
-]
+# SILVER (CSV) E GOLD (JSON)
 
-
-def aplicar_desvio_movel(registros):
-    janelas = {m: deque(maxlen=JANELA_DESVIO) for m in METRICAS_DESVIO}
-    for reg in registros:
-        for m in METRICAS_DESVIO:
-            janelas[m].append(reg.get(m))
-            reg[f"{m}_dp{JANELA_DESVIO}"] = desvio(janelas[m])
-    return registros
-
-
-
-# SILVER - CSV
-
-
-def gravar_silver(pasta_empresa, identificador, registros):
+def gravar_silver(pasta_empresa, identificador, df):
     diretorio = os.path.join(DIR_SILVER, pasta_empresa)
     os.makedirs(diretorio, exist_ok=True)
     caminho = os.path.join(diretorio, f"{identificador}_sistema.csv")
-    colunas = list(registros[0].keys())
-    with open(caminho, "w", newline="", encoding="utf-8") as f:
-        escritor = csv.DictWriter(f, fieldnames=colunas, delimiter=DELIMITADOR_SAIDA)
-        escritor.writeheader()
-        for reg in registros:
-            linha = dict(reg)
-            linha["cpu_por_nucleo"] = "|".join(str(v) for v in reg["cpu_por_nucleo"]) or None
-            escritor.writerow({k: ("NA" if v is None else v) for k, v in linha.items()})
+
+    df_out = df.copy()
+    if "cpu_por_nucleo" in df_out.columns:
+        df_out["cpu_por_nucleo"] = df_out["cpu_por_nucleo"].apply(
+            lambda v: "|".join(str(x) for x in v) if isinstance(v, list) and v else None
+        )
+    df_out.to_csv(caminho, sep=DELIMITADOR_SAIDA, index=False, na_rep="NA", encoding="utf-8")
     return caminho
 
 
-# GOLD - JSON
+def historico(df, campos):
+    colunas = ["timestamp"]
+    for c in campos:
+        if c in df.columns:
+            colunas.append(c)
+        chave_dp = f"{c}_dp{JANELA_DESVIO}"
+        if chave_dp in df.columns:
+            colunas.append(chave_dp)
+
+    registros = df[colunas].to_dict(orient="records")
+    return [{k: limpar_valor_json(v) for k, v in r.items()} for r in registros]
 
 
-def historico(registros, campos):
-    serie = []
-    for r in registros:
-        ponto = {"timestamp": r["timestamp"]}
-        for c in campos:
-            ponto[c] = r.get(c)
-            chave_dp = f"{c}_dp{JANELA_DESVIO}"
-            if chave_dp in r:
-                ponto[f"{c}_dp{JANELA_DESVIO}"] = r[chave_dp]
-        serie.append(ponto)
-    return serie
-
-
-def ultimo_valido(registros, campo):
-    for r in reversed(registros):
-        if r.get(campo) not in (None, []):
-            return r[campo]
-    return None
-
-
-def montar_gold(registros):
-    serie = lambda c: [r.get(c) for r in registros]
-    ult = lambda c: ultimo_valido(registros, c)
+def montar_gold(df, processos_ram=None):
+    ult = lambda c: ultimo_valido(df, c)
+    est = lambda c: estatisticas_serie(df[c]) if c in df.columns else estatisticas_serie(pd.Series(dtype="float64"))
 
     return {
         "empresa": {
@@ -513,9 +478,9 @@ def montar_gold(registros):
             "nome": ult("vm_nome"),
             "hostname": ult("hostname"),
             "os": ult("os"),
-            "primeiro_registro": registros[0]["timestamp"],
-            "ultimo_registro": registros[-1]["timestamp"],
-            "total_registros": len(registros),
+            "primeiro_registro": str(df["timestamp"].iloc[0]),
+            "ultimo_registro": str(df["timestamp"].iloc[-1]),
+            "total_registros": int(len(df)),
             "janela_desvio_padrao": JANELA_DESVIO,
         },
         "cpu": {
@@ -526,16 +491,18 @@ def montar_gold(registros):
                 "nucleos_logicos": ult("cpu_nucleos_logicos"),
                 "qtd_processos": ult("qtd_processos"),
                 "qtd_threads": ult("qtd_threads"),
-                "modos_percent": {"user": ult("cpu_user_pct"), "sys": ult("cpu_sys_pct"),
-                                  "nice": ult("cpu_nice_pct"), "idle": ult("cpu_idle_pct"),
-                                  "iowait": ult("cpu_iowait_pct")},
+                "modos_percent": {
+                    "user": ult("cpu_user_pct"), "sys": ult("cpu_sys_pct"),
+                    "nice": ult("cpu_nice_pct"), "idle": ult("cpu_idle_pct"),
+                    "iowait": ult("cpu_iowait_pct"),
+                },
             },
-            "resumo": {"uso_percent": estatisticas(serie("cpu_percent")),
-                       "load_1m": estatisticas(serie("load_1m"))},
-            "historico": historico(registros, [
+            "resumo": {"uso_percent": est("cpu_percent"), "load_1m": est("load_1m")},
+            "historico": historico(df, [
                 "cpu_percent", "cpu_por_nucleo", "load_1m", "load_5m", "load_15m",
                 "cpu_user_pct", "cpu_sys_pct", "cpu_nice_pct", "cpu_idle_pct",
-                "cpu_iowait_pct", "qtd_processos"]),
+                "cpu_iowait_pct", "qtd_processos",
+            ]),
         },
         "ram": {
             "atual": {
@@ -543,16 +510,25 @@ def montar_gold(registros):
                 "total_gb": ult("ram_total_gb"),
                 "disponivel_gb": ult("ram_disponivel_gb"),
                 "usada_gb": ult("ram_usada_gb"),
-                "modos_gb": {"cached": ult("ram_cached_gb"), "buffers": ult("ram_buffers_gb"),
-                             "shared": ult("ram_shared_gb"), "slab": ult("ram_slab_gb"),
-                             "available": ult("ram_disponivel_gb")},
-                "buffers_cache": {"usado_gb": ult("ram_buff_cache_usado_gb"),
-                                  "total_gb": ult("ram_buff_cache_total_gb")},
+                "modos_gb": {
+                    "cached": ult("ram_cached_gb"), "buffers": ult("ram_buffers_gb"),
+                    "shared": ult("ram_shared_gb"), "slab": ult("ram_slab_gb"),
+                    "available": ult("ram_disponivel_gb"),
+                },
+                "buffers_cache": {
+                    "usado_gb": ult("ram_buff_cache_usado_gb"),
+                    "total_gb": ult("ram_buff_cache_total_gb"),
+                },
             },
-            "resumo": {"uso_percent": estatisticas(serie("ram_percent"))},
-            "historico": historico(registros, [
+            "resumo": {"uso_percent": est("ram_percent")},
+            "previsao": calcular_previsao_ram(df),
+            "alertas_24h": contar_alertas_ram_24h(df),
+            "proximo_pico": calcular_proximo_pico(),
+            "processos": processos_ram or {"maior_uso": [], "maior_crescimento": []},
+            "historico": historico(df, [
                 "ram_percent", "ram_usada_gb", "ram_disponivel_gb", "ram_cached_gb",
-                "ram_buffers_gb", "ram_shared_gb", "ram_slab_gb", "ram_buff_cache_usado_gb"]),
+                "ram_buffers_gb", "ram_shared_gb", "ram_slab_gb", "ram_buff_cache_usado_gb",
+            ]),
         },
         "disco": {
             "atual": {
@@ -562,19 +538,27 @@ def montar_gold(registros):
                 "livre_gb": ult("disco_livre_gb"),
                 "leitura_bytes_s": ult("disco_leitura_bytes_s"),
                 "escrita_bytes_s": ult("disco_escrita_bytes_s"),
-                "iops": {"leitura": ult("disco_iops_leitura"), "escrita": ult("disco_iops_escrita"),
-                         "total": ult("disco_iops_total")},
-                "latencia_ms": {"leitura": ult("disco_latencia_leitura_ms"),
-                                "escrita": ult("disco_latencia_escrita_ms"),
-                                "media": ult("disco_latencia_ms")},
+                "iops": {
+                    "leitura": ult("disco_iops_leitura"),
+                    "escrita": ult("disco_iops_escrita"),
+                    "total": ult("disco_iops_total"),
+                },
+                "latencia_ms": {
+                    "leitura": ult("disco_latencia_leitura_ms"),
+                    "escrita": ult("disco_latencia_escrita_ms"),
+                    "media": ult("disco_latencia_ms"),
+                },
             },
-            "resumo": {"uso_percent": estatisticas(serie("disco_percent")),
-                       "iops_total": estatisticas(serie("disco_iops_total")),
-                       "latencia_ms": estatisticas(serie("disco_latencia_ms"))},
-            "historico": historico(registros, [
+            "resumo": {
+                "uso_percent": est("disco_percent"),
+                "iops_total": est("disco_iops_total"),
+                "latencia_ms": est("disco_latencia_ms"),
+            },
+            "historico": historico(df, [
                 "disco_percent", "disco_leitura_bytes_s", "disco_escrita_bytes_s",
                 "disco_iops_leitura", "disco_iops_escrita", "disco_iops_total",
-                "disco_latencia_leitura_ms", "disco_latencia_escrita_ms", "disco_latencia_ms"]),
+                "disco_latencia_leitura_ms", "disco_latencia_escrita_ms", "disco_latencia_ms",
+            ]),
         },
         "swap": {
             "atual": {
@@ -582,49 +566,39 @@ def montar_gold(registros):
                 "total_gb": ult("swap_total_gb"),
                 "disponivel_gb": ult("swap_disponivel_gb"),
                 "usada_gb": ult("swap_usada_gb"),
+                "sin_mb_s": ult("swap_sin_mb_s"),
+                "sout_mb_s": ult("swap_sout_mb_s"),
             },
-            "resumo": {"uso_percent": estatisticas(serie("swap_percent"))},
-            "historico": historico(registros, ["swap_percent", "swap_usada_gb"]),
+            "resumo": {"uso_percent": est("swap_percent")},
+            "historico": historico(df, ["swap_percent", "swap_usada_gb", "swap_sin_mb_s", "swap_sout_mb_s"]),
         },
         "rede": {
             "atual": {
-                "conexoes": {"established": ult("rede_established"),
-                             "time_wait": ult("rede_time_wait"),
-                             "close_wait": ult("rede_close_wait"),
-                             "total": ult("rede_conn_total")},
+                "conexoes": {
+                    "established": ult("rede_established"),
+                    "time_wait": ult("rede_time_wait"),
+                    "close_wait": ult("rede_close_wait"),
+                    "total": ult("rede_conn_total"),
+                },
                 "perda_pacotes_pct": ult("rede_perda_pacotes_pct"),
                 "upload_bytes_s": ult("rede_upload_bytes_s"),
                 "download_bytes_s": ult("rede_download_bytes_s"),
             },
-            "resumo": {"upload_bytes_s": estatisticas(serie("rede_upload_bytes_s")),
-                       "download_bytes_s": estatisticas(serie("rede_download_bytes_s")),
-                       "perda_pacotes_pct": estatisticas(serie("rede_perda_pacotes_pct"))},
-            "historico": historico(registros, [
+            "resumo": {
+                "upload_bytes_s": est("rede_upload_bytes_s"),
+                "download_bytes_s": est("rede_download_bytes_s"),
+                "perda_pacotes_pct": est("rede_perda_pacotes_pct"),
+            },
+            "historico": historico(df, [
                 "rede_upload_bytes_s", "rede_download_bytes_s", "rede_perda_pacotes_pct",
-                "rede_established", "rede_time_wait", "rede_close_wait", "rede_conn_total"]),
+                "rede_established", "rede_time_wait", "rede_close_wait", "rede_conn_total",
+            ]),
         },
     }
 
-
-def nome_seguro(texto):
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(texto))[:120]
-
-
-def ultimo_valido_bronze(linhas, *colunas):
-    for linha in reversed(linhas):
-        for col in colunas:
-            valor = para_texto(linha.get(col))
-            if valor:
-                return valor
-    return None
-
-
-
 # EXECUÇÃO
 
-
 def main():
-    # 1. Download do S3 se ativado
     baixar_bronze_s3()
 
     if not os.path.isdir(DIR_BRONZE):
@@ -641,68 +615,79 @@ def main():
 
     mapa_bd = carregar_maquinas_bd()
 
-    por_maquina = {}
-    for caminho in arquivos:
-        # Apenas processa arquivos de sistema principal
-        if "_particoes.csv" in caminho or "_processos.csv" in caminho or "_conexoes_rede.csv" in caminho:
-            continue
-        print(f"Lendo {caminho}")
-        for linha in ler_bronze(caminho):
-            chave = normalizar_identificador(linha["identifier"])
-            if chave:
-                por_maquina.setdefault(chave, []).append(linha)
+    dfs_por_maquina = {}
+    arquivos_processos = {}
 
-    if not por_maquina:
+    for caminho in arquivos:
+        if "_particoes.csv" in caminho or "_conexoes_rede.csv" in caminho:
+            continue
+        if "_processos.csv" in caminho:
+            nome_arq = os.path.basename(caminho).replace("_processos.csv", "")
+            chave = normalizar_identificador(nome_arq)
+            if chave:
+                arquivos_processos.setdefault(chave, []).append(caminho)
+            continue
+
+        print(f"Lendo {caminho}")
+        df_lido = ler_bronze(caminho)
+        if df_lido.empty:
+            continue
+
+        for ident_raw, grupo_df in df_lido.groupby("identifier"):
+            chave = normalizar_identificador(ident_raw)
+            if chave:
+                dfs_por_maquina.setdefault(chave, []).append(grupo_df)
+
+    if not dfs_por_maquina:
         print("[AVISO] Nenhuma linha válida encontrada nos arquivos bronze.")
         return
 
     indice = {}
-    for identificador, linhas in por_maquina.items():
-        linhas.sort(key=lambda l: l["_ts"])
+    for identificador, lista_dfs in dfs_por_maquina.items():
+        df_bronze = pd.concat(lista_dfs, ignore_index=True)
+        df_bronze = df_bronze.sort_values("_ts").drop_duplicates(subset=["identifier", "_ts"], keep="last").reset_index(drop=True)
 
-        # Identificação da Empresa: BD > CSV Bronze > Fallback "sem_empresa"
-        empresa_id = (mapa_bd.get(identificador, {}).get("empresa_id") or
-                      ultimo_valido_bronze(linhas, "enterprise_identifier", "empresa_id") or "sem_empresa")
-        empresa_nome = (mapa_bd.get(identificador, {}).get("empresa_nome") or
-                        ultimo_valido_bronze(linhas, "enterprise_reason", "empresa_nome") or "Empresa Desconhecida")
+        empresa_id = (
+            mapa_bd.get(identificador, {}).get("empresa_id")
+            or ultimo_valido_bronze(df_bronze, "enterprise_identifier", "empresa_id")
+            or "sem_empresa"
+        )
+        empresa_nome = (
+            mapa_bd.get(identificador, {}).get("empresa_nome")
+            or ultimo_valido_bronze(df_bronze, "enterprise_reason", "empresa_nome")
+            or "Empresa Desconhecida"
+        )
         vm_nome = mapa_bd.get(identificador, {}).get("vm_nome")
 
         empresa = {
             "empresa_id": empresa_id,
             "empresa_nome": empresa_nome,
-            "vm_nome": vm_nome
+            "vm_nome": vm_nome,
         }
 
-        registros, anterior = [], None
-        for linha in linhas:
-            try:
-                registros.append(transformar_linha(linha, anterior, empresa))
-                anterior = linha
-            except Exception as erro:
-                print(f"  [AVISO] Linha ignorada ({identificador} {linha.get('timestamp')}): {erro}")
-
-        if not registros:
+        df_tratado = transformar_dataframe(df_bronze, empresa)
+        if df_tratado.empty:
             continue
 
-        aplicar_desvio_movel(registros)
         nome = nome_seguro(identificador)
         pasta_empresa = nome_seguro(empresa_id)
 
-        caminho_silver = gravar_silver(pasta_empresa, nome, registros)
+        # Silver
+        caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado)
+        enviar_para_s3(caminho_silver, f"{AWS_PREFIXO_SILVER}/{pasta_empresa}/{nome}_sistema.csv")
 
-        chave_s3_silver = f"{AWS_PREFIXO_SILVER}/{pasta_empresa}/{nome}_sistema.csv"
-        enviar_para_s3(caminho_silver, chave_s3_silver)
+        # Gold
+        proc_ram = processar_processos_ram(arquivos_processos.get(identificador, []))
+        gold = montar_gold(df_tratado, processos_ram=proc_ram)
 
-        gold = montar_gold(registros)
         dir_gold_empresa = os.path.join(DIR_GOLD, pasta_empresa)
         os.makedirs(dir_gold_empresa, exist_ok=True)
-
         caminho_gold = os.path.join(dir_gold_empresa, f"{nome}_sistema.json")
+
         with open(caminho_gold, "w", encoding="utf-8") as f:
             json.dump(gold, f, ensure_ascii=False, indent=2)
 
-        chave_s3_gold_maq = f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/{nome}_sistema.json"
-        enviar_para_s3(caminho_gold, chave_s3_gold_maq)
+        enviar_para_s3(caminho_gold, f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/{nome}_sistema.json")
 
         grupo = indice.setdefault(pasta_empresa, {
             "empresa_id": empresa_id,
@@ -716,23 +701,18 @@ def main():
             "ram_percent": gold["ram"]["atual"]["uso_percent"],
             "disco_percent": gold["disco"]["atual"]["uso_percent"],
         })
-        print(f"  OK {identificador} ({empresa_nome}): {len(registros)} registros -> {caminho_silver} | {caminho_gold}")
+        print(f"  OK {identificador} ({empresa_nome}): {len(df_tratado)} registros -> {caminho_silver} | {caminho_gold}")
 
     for pasta_empresa, grupo in indice.items():
         caminho_indice_emp = os.path.join(DIR_GOLD, pasta_empresa, "indice_maquinas.json")
-
         with open(caminho_indice_emp, "w", encoding="utf-8") as f:
             json.dump(grupo, f, ensure_ascii=False, indent=2)
-
-        chave_s3_indice_emp = f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/indice_maquinas.json"
-        enviar_para_s3(caminho_indice_emp, chave_s3_indice_emp) 
+        enviar_para_s3(caminho_indice_emp, f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/indice_maquinas.json")
 
     caminho_indice_global = os.path.join(DIR_GOLD, "indice_maquinas.json")
     with open(caminho_indice_global, "w", encoding="utf-8") as f:
         json.dump({"empresas": list(indice.values())}, f, ensure_ascii=False, indent=2)
-
-    chave_s3_indice_global = f"{AWS_PREFIXO_GOLD}/indice_maquinas.json"
-    enviar_para_s3(caminho_indice_global, chave_s3_indice_global)
+    enviar_para_s3(caminho_indice_global, f"{AWS_PREFIXO_GOLD}/indice_maquinas.json")
 
     total = sum(len(g["maquinas"]) for g in indice.values())
     print(f"Concluído: {total} máquina(s) de {len(indice)} empresa(s) processada(s).")
