@@ -16,6 +16,8 @@ Usa pandas + python-dotenv + mysql.connector (opcional BD) + boto3 (opcional S3)
 ==========================================================================================
 """
 
+
+
 import glob
 import json
 import os
@@ -40,7 +42,7 @@ DIR_BASE = "./track-commerce"
 DIR_BRONZE = os.path.join(DIR_BASE, "bronze")
 DIR_SILVER = os.path.join(DIR_BASE, "silver")
 DIR_GOLD = os.path.join(DIR_BASE, "gold")
-ARQUIVO_EVENTOS = os.path.join(DIR_BASE, "eventos.json")
+ARQUIVO_EVENTOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eventos.json")
 
 DELIMITADOR_SAIDA = ";"
 FORMATO_TIMESTAMP = "%Y-%m-%d %H:%M:%S"
