@@ -62,16 +62,6 @@ TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
 # Partições ignoradas no monitoramento
 FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"} # Partições não especificadas no arquivo de Capturas de Métricas e no Figma
 
-# Configurações AWS S3 (opcional) 
-AWS_ENVIAR = os.getenv("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
-AWS_BUCKET = os.getenv("AWS_BUCKET", "")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
-AWS_PREFIXO = "track-commerce/bronze"
-INTERVALO_UPLOAD_S = int(os.getenv("INTERVALO_UPLOAD_S", "300"))
-
 
 
 #diretório padrão da aplicação
@@ -115,13 +105,12 @@ _regiao_detectada = obter_regiao_instancia()
 regiao_instancia = _regiao_detectada or "Desconhecida"
 
 AWS_ENVIAR = config.get("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
-AWS_BUCKET = config.get("AWS_BUCKET", "")
 AWS_REGION = config.get("AWS_REGION") or os.getenv("AWS_REGION") or _regiao_detectada or "us-east-1"
 AWS_ACCESS_KEY_ID = config.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = config.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = config.get("AWS_SESSION_TOKEN", "")
-AWS_PREFIXO = "track-commerce/bronze"
 INTERVALO_UPLOAD_S = int(config.get("INTERVALO_UPLOAD_S", "300"))
+AWS_BUCKET_BRONZE = os.getenv("AWS_BUCKET_BRONZE", "").strip()
 
 
 # ==========================================================================================
@@ -229,6 +218,10 @@ HEADER_SISTEMA = [
     # Identificação
     "identifier", "enterprise_identifier", "enterprise_reason", "vm_nome",
     "timestamp", "hostname", "os", "platform", "region", "boot_time",
+    # Hardware normalizado / EC2 metadata
+    "vcpus", "ram_gb", "disk_gb",
+    "ec2_instance_id", "ec2_instance_type", "ec2_availability_zone", "ec2_region",
+    "ec2_tenancy", "ec2_license_model", "hardware_payload_source",
 
     # CPU
     "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
@@ -316,7 +309,7 @@ def obter_cliente_s3():
         print("[AVISO] AWS_ENVIAR=True, mas boto3 não está instalado. Envio ao S3 desativado.")
         _s3_desativado = True
         return None
-    if not (AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+    if not (AWS_BUCKET_BRONZE and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
         print("[AVISO] Bucket ou credenciais AWS ausentes no arquivo .env. Envio ao S3 desativado.")
         _s3_desativado = True
         return None
@@ -335,16 +328,20 @@ def obter_cliente_s3():
 
 
 def enviar_arquivos_s3(caminhos):
+    empresa = str(registro_agente.get("id_empresa") or "")
+    if not empresa.isdecimal():
+        print("[AVISO] ID de empresa inválido; CSVs mantidos apenas localmente.")
+        return
     cliente = obter_cliente_s3()
     if cliente is None:
         return
     for caminho in caminhos:
         if not os.path.isfile(caminho):
             continue
-        chave = f"{AWS_PREFIXO}/{os.path.basename(caminho)}"
+        chave = f"{empresa}/{os.path.basename(caminho)}"
         try:
-            cliente.upload_file(caminho, AWS_BUCKET, chave)
-            print(f"[S3] Enviado: s3://{AWS_BUCKET}/{chave}")
+            cliente.upload_file(caminho, AWS_BUCKET_BRONZE, chave)
+            print(f"[S3] Enviado: s3://{AWS_BUCKET_BRONZE}/{chave}")
         except Exception as erro:
             print(f"[AVISO] Falha ao enviar {caminho} ao S3: {erro}")
 
@@ -438,6 +435,55 @@ def contar_conexoes_resumo():
     return {"total": total, **principais, "outros": total - sum(principais.values())}
 
 
+def obter_metadados_ec2(timeout=0.3):
+    """
+    Tenta obter metadados EC2 via IMDSv2/v1. Retorna dicionário com chaves:
+    ec2_instance_id, ec2_instance_type, ec2_availability_zone, ec2_region, ec2_tenancy, _ec2_metadata_ok
+    """
+    base = "http://169.254.169.254/latest"
+    headers = {}
+    try:
+        # IMDSv2 token
+        req = urllib.request.Request(base + "/api/token", method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            token = r.read().decode("utf-8")
+            if token:
+                headers["X-aws-ec2-metadata-token"] = token
+    except Exception:
+        # token failure -> try IMDSv1 fallback
+        headers = {}
+
+    def _md(path):
+        try:
+            req = urllib.request.Request(base + path, headers=headers or None)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8")
+        except Exception:
+            return None
+
+    inst_id = _md("/meta-data/instance-id")
+    inst_type = _md("/meta-data/instance-type")
+    az = _md("/meta-data/placement/availability-zone")
+    tenancy = _md("/meta-data/placement/tenancy") or None
+    doc = _md("/dynamic/instance-identity/document")
+    region = None
+    if doc:
+        try:
+            j = json.loads(doc)
+            region = j.get("region")
+        except Exception:
+            region = None
+
+    return {
+        "ec2_instance_id": inst_id,
+        "ec2_instance_type": inst_type,
+        "ec2_availability_zone": az,
+        "ec2_region": region,
+        "ec2_tenancy": tenancy,
+        "_ec2_metadata_ok": bool(inst_id or inst_type)
+    }
+
+
 def coletar_ciclo():
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -477,6 +523,21 @@ def coletar_ciclo():
     conexoes_detalhadas = coletar_conexoes_detalhadas(timestamp)
     processos = coletar_processos(timestamp)
     particoes = coletar_particoes(timestamp)
+    # hardware normalizado e detecção EC2
+    try:
+        vcpus = int(psutil.cpu_count(logical=True) or 1)
+    except Exception:
+        vcpus = None
+    try:
+        ram_gb = round(memoria.total / (1024 ** 3), 2) if memoria and getattr(memoria, "total", None) else None
+    except Exception:
+        ram_gb = None
+    try:
+        disk_gb = round(d_root_total / (1024 ** 3), 2) if d_root_total is not None else None
+    except Exception:
+        disk_gb = None
+    md = obter_metadados_ec2()
+    ec2_ok = md.get("_ec2_metadata_ok", False)
 
     dados = {
         "identifier": mach_uuid,
@@ -489,6 +550,21 @@ def coletar_ciclo():
         "platform": platform.platform(),
         "region": regiao_instancia,
         "boot_time": psutil.boot_time(),
+        # normalized hardware & EC2 metadata (may be None)
+        "vcpus": vcpus,
+        "ram_gb": ram_gb,
+        "disk_gb": disk_gb,
+        "ec2_instance_id": md.get("ec2_instance_id"),
+        "ec2_instance_type": md.get("ec2_instance_type"),
+        "ec2_availability_zone": md.get("ec2_availability_zone"),
+        "ec2_region": md.get("ec2_region"),
+        "ec2_tenancy": md.get("ec2_tenancy"),
+        "ec2_license_model": None,
+        # operacional system and preinstalled software hints for Pricing API
+        "ec2_operating_system": ( "Windows" if platform.system().lower().startswith("win") else
+                                  (md.get("platform") or platform.system()) ),
+        "ec2_preinstalled_sw": None,
+        "hardware_payload_source": "imds" if ec2_ok else "local_psutil",
 
         "cpu_percent": cpu_percent,
         "cpu_por_nucleo": "|".join(str(v) for v in por_nucleo),
