@@ -58,15 +58,13 @@ COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
 # S3 Download / Upload (Opcional)
 AWS_BAIXAR = os.getenv("AWS_BAIXAR", "False").lower() in ("true", "1", "t", "yes")
 AWS_UPLOAD = os.getenv("AWS_UPLOAD", "False").lower() in ("true", "1", "t", "yes")
-AWS_BUCKET = os.getenv("AWS_BUCKET", "")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
-# AWS_PREFIXO = "track-commerce/bronze"
-AWS_PREFIXO_BRONZE = "track-commerce/bronze"
-AWS_PREFIXO_SILVER = "track-commerce/silver"
-AWS_PREFIXO_GOLD = "track-commerce/gold"
+AWS_BUCKET_BRONZE = os.getenv("AWS_BUCKET_BRONZE", "").strip()
+AWS_BUCKET_SILVER = os.getenv("AWS_BUCKET_SILVER", "").strip()
+AWS_BUCKET_GOLD = os.getenv("AWS_BUCKET_GOLD", "").strip()
 
 METRICAS_DESVIO = [
     "cpu_percent", "load_1m", "cpu_iowait_pct",
@@ -79,7 +77,7 @@ METRICAS_DESVIO = [
 # AWS S3 E BANCO DE DADOS
 
 def obter_cliente_s3():
-    if not (boto3 and AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+    if not (boto3 and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
         return None
     return boto3.client(
         "s3",
@@ -91,7 +89,7 @@ def obter_cliente_s3():
 
 def baixar_bronze_s3():
     """Baixa automaticamente os CSVs do S3 para a pasta local bronze antes do processamento."""
-    if not (AWS_BAIXAR and boto3 and AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+    if not (AWS_BAIXAR and AWS_BUCKET_BRONZE):
         return
 
     s3 = obter_cliente_s3()
@@ -103,28 +101,32 @@ def baixar_bronze_s3():
     try:
         os.makedirs(DIR_BRONZE, exist_ok=True)
         paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=AWS_BUCKET, Prefix=AWS_PREFIXO_BRONZE):
+        for page in paginator.paginate(Bucket=AWS_BUCKET_BRONZE):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.endswith(".csv"):
+                if key.count("/") == 1 and key.split("/", 1)[0].isdecimal() and key.endswith(".csv"):
                     nome_arquivo = os.path.basename(key)
                     destino = os.path.join(DIR_BRONZE, nome_arquivo)
-                    s3.download_file(AWS_BUCKET, key, destino)
+                    s3.download_file(AWS_BUCKET_BRONZE, key, destino)
                     print(f"  [S3 DOWNLOAD] Baixado: {key} -> {destino}")
     except Exception as erro:
         print(f"  [ERRO S3 DOWNLOAD] Falha ao sincronizar com S3: {erro}")
 
-def enviar_para_s3(caminho_local, chave_s3):
+def enviar_para_s3(caminho_local, chave_s3, bucket, documento=None):
     """Faz o upload de um arquivo local para o bucket S3."""
     if not AWS_UPLOAD:
-            return
+        return
     
     s3 = obter_cliente_s3()
     if not s3:
         return
 
     try:
-        s3.upload_file(caminho_local, AWS_BUCKET, chave_s3)
+        if documento is None:
+            s3.upload_file(caminho_local, bucket, chave_s3)
+        else:
+            s3.put_object(Bucket=bucket, Key=chave_s3, ContentType="application/json",
+                          Body=json.dumps(documento, ensure_ascii=False).encode("utf-8"))
         print(f"  [S3 UPLOAD] Enviado: {chave_s3}")
     except Exception as erro:
         print(f"  [ERRO S3 UPLOAD] Falha ao enviar {caminho_local}: {erro}")
@@ -184,9 +186,76 @@ def col_num(df, coluna):
     return pd.to_numeric(df[coluna].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
 
+<<<<<<< Updated upstream
 def col_pos(df, coluna):
     s = col_num(df, coluna)
     return s.where(s >= 0)
+=======
+# ======= Enriquecimento de hardware / detecção EC2 (sidecar / inferência CSV) =======
+def _read_sidecar_json_from_path(bronze_path):
+    """Procura sidecar JSON próximo ao CSV (prefixo_meta.json ou mesmo .json)."""
+    try:
+        from pathlib import Path
+        p = Path(bronze_path)
+        candidates = [p.with_name(p.stem + "_meta.json"), p.with_suffix(".json")]
+        for c in candidates:
+            if c.exists():
+                try:
+                    return json.loads(c.read_text(encoding="utf-8"))
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
+def extrair_hardware_info_da_linha(linha):
+    """
+    Retorna dict com campos normalizados necessários para Pricing/estimativas:
+    vcpus, ram_gb, disk_gb, ec2_instance_id, ec2_instance_type, ec2_availability_zone,
+    ec2_region, ec2_tenancy, ec2_license_model, hardware_payload_source
+    """
+    info = {}
+    # Inferências diretas do CSV (quando presentes)
+    try:
+        v = linha.get("cpu_count_logical") or linha.get("cpu_count") or linha.get("cpu_nucleos_logicos")
+        info["vcpus"] = int(v) if v not in (None, "", "None") else None
+    except Exception:
+        info["vcpus"] = None
+
+    try:
+        info["ram_gb"] = para_gb(para_positivo(linha.get("ram_total") or linha.get("ram_total_bytes") or linha.get("ram_total_gb")))
+    except Exception:
+        info["ram_gb"] = None
+
+    try:
+        info["disk_gb"] = para_gb(para_positivo(linha.get("disk_root_total") or linha.get("disk_total") or linha.get("disco_total_gb")))
+    except Exception:
+        info["disk_gb"] = None
+
+    # Possíveis campos EC2 já presentes no CSV (ex.: se agente escreveu sidecar para JSON incluído no CSV)
+    info["ec2_instance_id"] = para_texto(linha.get("ec2_instance_id") or linha.get("instance_id") or linha.get("instance") )
+    info["ec2_instance_type"] = para_texto(linha.get("ec2_instance_type") or linha.get("instance_type"))
+    info["ec2_availability_zone"] = para_texto(linha.get("ec2_availability_zone") or linha.get("availability_zone"))
+    info["ec2_region"] = para_texto(linha.get("ec2_region") or linha.get("region"))
+    info["ec2_tenancy"] = para_texto(linha.get("ec2_tenancy") or linha.get("tenancy")) or "default"
+    info["ec2_license_model"] = para_texto(linha.get("ec2_license_model") or linha.get("license_model")) or "no_license"
+
+    # Fonte do dado
+    if any(k in linha for k in ("ec2_instance_id", "ec2_instance_type", "declared_monthly_cost", "capture_version")):
+        info["hardware_payload_source"] = "sidecar_or_agent"
+    else:
+        info["hardware_payload_source"] = "csv_inferred"
+
+    return info
+
+# =====================================================================================
+
+def dividir(a, b):
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
+>>>>>>> Stashed changes
 
 
 def col_pct(df, coluna):
@@ -354,7 +423,13 @@ def transformar_dataframe(df_bronze, empresa):
     out = pd.DataFrame({
         "empresa_id": empresa["empresa_id"],
         "empresa_nome": empresa["empresa_nome"],
+<<<<<<< Updated upstream
         "identifier": df["identifier"].apply(para_texto),
+=======
+        # Hardware / FinOps (normalizados)
+        **extrair_hardware_info_da_linha(linha),
+        "identifier": para_texto(linha.get("identifier")),
+>>>>>>> Stashed changes
         "vm_nome": empresa.get("vm_nome"),
         "hostname": df["hostname"].apply(para_texto) if "hostname" in df.columns else None,
         "os": df["os"].apply(para_texto) if "os" in df.columns else None,
@@ -730,6 +805,16 @@ def montar_gold(df, processos_ram=None):
 # EXECUÇÃO
 
 def main():
+<<<<<<< Updated upstream
+=======
+    if AWS_BAIXAR or AWS_UPLOAD:
+        configurados = [b for b in (AWS_BUCKET_BRONZE, AWS_BUCKET_SILVER, AWS_BUCKET_GOLD) if b]
+        if len(configurados) != len(set(configurados)):
+            raise ValueError("Configure buckets distintos para Bronze, Silver e Gold.")
+        if (AWS_BAIXAR and not AWS_BUCKET_BRONZE) or (AWS_UPLOAD and not (AWS_BUCKET_SILVER and AWS_BUCKET_GOLD)):
+            raise ValueError("Bucket ausente para a operação S3 habilitada.")
+    # 1. Download do S3 se ativado
+>>>>>>> Stashed changes
     baixar_bronze_s3()
 
     if not os.path.isdir(DIR_BRONZE):
@@ -807,9 +892,14 @@ def main():
         caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado)
         enviar_para_s3(caminho_silver, f"{AWS_PREFIXO_SILVER}/{pasta_empresa}/{nome}_sistema.csv")
 
+<<<<<<< Updated upstream
         # Gold
         proc_ram = processar_processos_ram(arquivos_processos.get(identificador, []))
         gold = montar_gold(df_tratado, processos_ram=proc_ram)
+=======
+        chave_s3_silver = f"{pasta_empresa}/{os.path.basename(caminho_silver)}"
+        enviar_para_s3(caminho_silver, chave_s3_silver, bucket=AWS_BUCKET_SILVER)
+>>>>>>> Stashed changes
 
         dir_gold_empresa = os.path.join(DIR_GOLD, pasta_empresa)
         os.makedirs(dir_gold_empresa, exist_ok=True)
@@ -818,7 +908,12 @@ def main():
         with open(caminho_gold, "w", encoding="utf-8") as f:
             json.dump(gold, f, ensure_ascii=False, indent=2)
 
+<<<<<<< Updated upstream
         enviar_para_s3(caminho_gold, f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/{nome}_sistema.json")
+=======
+        chave_s3_gold_maq = f"{pasta_empresa}/{os.path.basename(caminho_gold)}"
+        enviar_para_s3(caminho_gold, chave_s3_gold_maq, bucket=AWS_BUCKET_GOLD)
+>>>>>>> Stashed changes
 
         grupo = indice.setdefault(pasta_empresa, {
             "empresa_id": empresa_id,
@@ -834,16 +929,33 @@ def main():
         })
         print(f"  OK {identificador} ({empresa_nome}): {len(df_tratado)} registros -> {caminho_silver} | {caminho_gold}")
 
+    grupos_s3 = []
     for pasta_empresa, grupo in indice.items():
         caminho_indice_emp = os.path.join(DIR_GOLD, pasta_empresa, "indice_maquinas.json")
         with open(caminho_indice_emp, "w", encoding="utf-8") as f:
             json.dump(grupo, f, ensure_ascii=False, indent=2)
+<<<<<<< Updated upstream
         enviar_para_s3(caminho_indice_emp, f"{AWS_PREFIXO_GOLD}/{pasta_empresa}/indice_maquinas.json")
+=======
+
+        grupo_s3 = {**grupo, "maquinas": [
+            {**m, "arquivo": os.path.basename(m["arquivo"])} for m in grupo["maquinas"]
+        ]}
+        grupos_s3.append(grupo_s3)
+        enviar_para_s3(caminho_indice_emp, f"indice_maquinas_empresa_{pasta_empresa}.json",
+                       AWS_BUCKET_GOLD, documento=grupo_s3)
+>>>>>>> Stashed changes
 
     caminho_indice_global = os.path.join(DIR_GOLD, "indice_maquinas.json")
     with open(caminho_indice_global, "w", encoding="utf-8") as f:
         json.dump({"empresas": list(indice.values())}, f, ensure_ascii=False, indent=2)
+<<<<<<< Updated upstream
     enviar_para_s3(caminho_indice_global, f"{AWS_PREFIXO_GOLD}/indice_maquinas.json")
+=======
+
+    enviar_para_s3(caminho_indice_global, "indice_maquinas.json", AWS_BUCKET_GOLD,
+                   documento={"empresas": grupos_s3})
+>>>>>>> Stashed changes
 
     total = sum(len(g["maquinas"]) for g in indice.values())
     print(f"Concluído: {total} máquina(s) de {len(indice)} empresa(s) processada(s).")
