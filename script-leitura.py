@@ -400,6 +400,13 @@ def transformar_dataframe(df_bronze, empresa):
     d_t_total = pd.DataFrame({"r": d_t_leitura, "w": d_t_escrita}).sum(axis=1, min_count=1)
 
     # Rede
+    rede_upload_bytes_s = taxa("network_bytes_sent")
+    rede_download_bytes_s = taxa("network_bytes_recv")
+    rede_upload_mb_m = ((rede_upload_bytes_s * 60) / BYTES_POR_MB).round(2)
+    rede_download_mb_m = ((rede_download_bytes_s * 60) / BYTES_POR_MB).round(2)
+    rede_upload_mil_pacotes_m = ((taxa("network_packets_sent") * 60) / 1000.0).round(2)
+    rede_download_mil_pacotes_m = ((taxa("network_packets_recv") * 60) / 1000.0).round(2)
+
     d_pac = pd.DataFrame({
         "s": delta_pos(col_pos(df, "network_packets_sent")),
         "r": delta_pos(col_pos(df, "network_packets_recv")),
@@ -413,6 +420,11 @@ def transformar_dataframe(df_bronze, empresa):
         "o": delta_pos(col_pos(df, "network_errout")),
     }).sum(axis=1, min_count=1)
     perda_pct = ((d_drop / (d_pac + d_drop).replace(0, float("nan"))) * 100).round(3)
+
+    net_est = col_pos(df, "net_established")
+    net_tw = col_pos(df, "net_time_wait")
+    net_cw = col_pos(df, "net_close_wait")
+    soma_tcp_3 = pd.DataFrame({"e": net_est, "t": net_tw, "c": net_cw}).sum(axis=1, min_count=1).replace(0, float("nan"))
 
     # CPU por núcleo
     if "cpu_por_nucleo" in df.columns:
@@ -489,14 +501,28 @@ def transformar_dataframe(df_bronze, empresa):
         "disco_latencia_ms": (d_t_total / d_io_total.replace(0, float("nan"))).round(3),
 
         # REDE
-        "rede_upload_bytes_s": taxa("network_bytes_sent"),
-        "rede_download_bytes_s": taxa("network_bytes_recv"),
+        "rede_upload_bytes_s": rede_upload_bytes_s,
+        "rede_download_bytes_s": rede_download_bytes_s,
+        "rede_upload_mb_m": rede_upload_mb_m,
+        "rede_download_mb_m": rede_download_mb_m,
+        "rede_upload_mil_pacotes_m": rede_upload_mil_pacotes_m,
+        "rede_download_mil_pacotes_m": rede_download_mil_pacotes_m,
+        "rede_perda_pacotes_local": d_drop.round(0),
         "rede_perda_pacotes_pct": perda_pct,
         "rede_erros_s": (d_err / intervalo).round(2),
-        "rede_established": col_pos(df, "net_established"),
-        "rede_time_wait": col_pos(df, "net_time_wait"),
-        "rede_close_wait": col_pos(df, "net_close_wait"),
+        "rede_established": net_est,
+        "rede_time_wait": net_tw,
+        "rede_close_wait": net_cw,
         "rede_conn_total": col_pos(df, "net_conn_total"),
+        "rede_established_pct": ((net_est / soma_tcp_3) * 100).round(1),
+        "rede_time_wait_pct": ((net_tw / soma_tcp_3) * 100).round(1),
+        "rede_close_wait_pct": ((net_cw / soma_tcp_3) * 100).round(1),
+        "ec2_public_ip": df["ec2_public_ip"].apply(para_texto) if "ec2_public_ip" in df.columns else None,
+        "globalping_regiao": df["globalping_regiao"].apply(para_texto) if "globalping_regiao" in df.columns else None,
+        "globalping_target": df["globalping_target"].apply(para_texto) if "globalping_target" in df.columns else None,
+        "globalping_latencia_ms": col_pos(df, "globalping_latencia_ms").round(2),
+        "globalping_perda_pct": col_pct(df, "globalping_perda_pct").round(2),
+        "globalping_perda_pacotes": col_pos(df, "globalping_perda_pacotes").round(0),
     })
 
     # Desvio padrão móvel vetorizado
@@ -641,6 +667,242 @@ def processar_processos_ram(caminhos_csv):
     }
 
 
+# CÁLCULOS DA DASHBOARD DE REDE (PANDAS)
+
+def _ultimo_nao_nulo(serie):
+    s = pd.to_numeric(serie, errors="coerce").dropna()
+    return float(s.iloc[-1]) if not s.empty else float("nan")
+
+
+def _soma_valida(serie):
+    s = pd.to_numeric(serie, errors="coerce").dropna()
+    return float(s.sum()) if not s.empty else float("nan")
+
+
+def _media_valida(serie):
+    s = pd.to_numeric(serie, errors="coerce").dropna()
+    return float(s.mean()) if not s.empty else float("nan")
+
+
+def agregar_janelas_15m_rede(df):
+    """Agrega as leituras de rede em janelas de 15 minutos."""
+    if df.empty or "timestamp" not in df.columns:
+        return pd.DataFrame()
+
+    sub = df.copy()
+    sub["_ts"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub = sub.dropna(subset=["_ts"]).sort_values("_ts")
+    if sub.empty:
+        return pd.DataFrame()
+
+    sub["_janela"] = sub["_ts"].dt.floor("15min")
+
+    colunas_soma = ["rede_perda_pacotes_local"]
+    colunas_media = [
+        "rede_download_mb_m", "rede_upload_mb_m",
+        "rede_download_mil_pacotes_m", "rede_upload_mil_pacotes_m",
+        "rede_perda_pacotes_pct",
+    ]
+    colunas_ultimo = [
+        "rede_established", "rede_time_wait", "rede_close_wait", "rede_conn_total",
+        "rede_established_pct", "rede_time_wait_pct", "rede_close_wait_pct",
+        "globalping_latencia_ms", "globalping_perda_pct", "globalping_perda_pacotes",
+    ]
+
+    linhas = []
+    for janela, grupo in sub.groupby("_janela", sort=True):
+        reg = {"_ts": janela, "timestamp": janela.strftime(FORMATO_TIMESTAMP)}
+        for col in colunas_soma:
+            if col in grupo.columns:
+                val = _soma_valida(grupo[col])
+                reg[col] = round(val, 0) if not pd.isna(val) else None
+        for col in colunas_media:
+            if col in grupo.columns:
+                val = _media_valida(grupo[col])
+                reg[col] = round(val, 2) if not pd.isna(val) else None
+        for col in colunas_ultimo:
+            if col in grupo.columns:
+                val = _ultimo_nao_nulo(grupo[col])
+                reg[col] = round(val, 2) if not pd.isna(val) else None
+        linhas.append(reg)
+
+    return pd.DataFrame(linhas)
+
+
+def _serie_limpa(df_base, coluna):
+    if df_base is None or df_base.empty or coluna not in df_base.columns:
+        return []
+    s = pd.to_numeric(df_base[coluna], errors="coerce").dropna()
+    return [limpar_valor_json(round(float(v), 2)) for v in s.tolist()]
+
+
+def _calcular_tendencia_serie(valores):
+    vals = [float(v) for v in valores if v is not None and not pd.isna(v)]
+    if len(vals) < 2:
+        return {"valor": 0, "direcao": "estavel", "texto": "Tendência desde última hora: 0%"}
+
+    atual = vals[-1]
+    anteriores = vals[:-1]
+    media_ant = sum(anteriores) / len(anteriores)
+
+    if media_ant == 0:
+        pct = 100 if atual > 0 else 0
+    else:
+        pct = round(((atual - media_ant) / media_ant) * 100)
+
+    sinal = "+" if pct > 0 else ""
+    direcao = "alta" if pct > 0 else ("baixa" if pct < 0 else "estavel")
+    return {
+        "valor": int(pct),
+        "direcao": direcao,
+        "texto": f"Tendência desde última hora: {sinal}{pct}%",
+    }
+
+
+def _filtrar_ultima_hora(df_base):
+    if df_base is None or df_base.empty or "timestamp" not in df_base.columns:
+        return pd.DataFrame()
+    sub = df_base.copy()
+    sub["_ts"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub = sub.dropna(subset=["_ts"]).sort_values("_ts")
+    if sub.empty:
+        return pd.DataFrame()
+    limite = sub["_ts"].max() - pd.Timedelta(hours=1)
+    return sub[sub["_ts"] >= limite]
+
+
+def calcular_tendencias_rede(df, df_15m):
+    """Calcula a tendência percentual da última hora para as 7 métricas da dashboard."""
+    janelas_1h = _filtrar_ultima_hora(df_15m)
+    raw_1h = _filtrar_ultima_hora(df)
+
+    mapa_metricas = {
+        "perda_local_pct": "rede_perda_pacotes_local",
+        "perda_externa_pct": "globalping_perda_pacotes",
+        "conexoes_established_pct": "rede_established_pct",
+        "volume_download_pct": "rede_download_mb_m",
+        "volume_upload_pct": "rede_upload_mb_m",
+        "pacotes_download_pct": "rede_download_mil_pacotes_m",
+        "pacotes_upload_pct": "rede_upload_mil_pacotes_m",
+    }
+
+    resultado = {}
+    for chave, col in mapa_metricas.items():
+        vals = _serie_limpa(janelas_1h, col)
+        if len(vals) < 2:
+            vals = _serie_limpa(raw_1h, col)
+        resultado[chave] = _calcular_tendencia_serie(vals)
+    return resultado
+
+
+def _prever_metrica_linear(df_base, coluna, percentual=False, janela=12):
+    """Calcula taxa de variação/hora e projeção para 1h por regressão linear, sem comparar alertas."""
+    if df_base is None or df_base.empty or coluna not in df_base.columns:
+        return {
+            "atual": None, "taxa_por_hora": 0.0,
+            "projecao_1h": None, "tendencia_direcao": "estavel",
+        }
+
+    sub = df_base[["timestamp", coluna]].tail(janela).copy()
+    sub["_ts"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub[coluna] = pd.to_numeric(sub[coluna], errors="coerce")
+    sub = sub.dropna(subset=["_ts", coluna])
+
+    if sub.empty:
+        return {
+            "atual": None, "taxa_por_hora": 0.0,
+            "projecao_1h": None, "tendencia_direcao": "estavel",
+        }
+
+    atual = round(float(sub[coluna].iloc[-1]), 2)
+    if len(sub) < 2:
+        return {
+            "atual": atual, "taxa_por_hora": 0.0,
+            "projecao_1h": atual, "tendencia_direcao": "estavel",
+        }
+
+    xs = (sub["_ts"] - sub["_ts"].iloc[0]).dt.total_seconds() / 60.0
+    ys = sub[coluna]
+    den = ((xs - xs.mean()) ** 2).sum()
+    inclinacao = float(((xs - xs.mean()) * (ys - ys.mean())).sum() / den) if den > 0 else 0.0
+    taxa_h = round(inclinacao * 60.0, 2)
+    dir_tend = "alta" if inclinacao > 0.001 else ("baixa" if inclinacao < -0.001 else "estavel")
+
+    projecao = round(atual + taxa_h, 2)
+    if percentual:
+        projecao = max(0.0, min(100.0, projecao))
+    else:
+        projecao = max(0.0, projecao)
+
+    return {
+        "atual": atual,
+        "taxa_por_hora": taxa_h,
+        "projecao_1h": projecao,
+        "tendencia_direcao": dir_tend,
+    }
+
+
+def calcular_previsao_rede(df, df_15m):
+    """Retorna projeções puramente numéricas das métricas de rede (comparação de alertas fica no Java)."""
+    base = df_15m if (df_15m is not None and len(df_15m) >= 2) else df
+
+    metricas = {
+        "perda_local": _prever_metrica_linear(base, "rede_perda_pacotes_local"),
+        "perda_externa": _prever_metrica_linear(base, "globalping_perda_pacotes"),
+        "conexoes_established_pct": _prever_metrica_linear(base, "rede_established_pct", percentual=True),
+        "volume_download_mb_m": _prever_metrica_linear(base, "rede_download_mb_m"),
+        "volume_upload_mb_m": _prever_metrica_linear(base, "rede_upload_mb_m"),
+        "pacotes_download_mil_m": _prever_metrica_linear(base, "rede_download_mil_pacotes_m"),
+        "pacotes_upload_mil_m": _prever_metrica_linear(base, "rede_upload_mil_pacotes_m"),
+        "latencia_externa_ms": _prever_metrica_linear(base, "globalping_latencia_ms"),
+    }
+
+    return {
+        "metricas": metricas,
+        "proximo_pico": calcular_proximo_pico(),
+    }
+
+
+def montar_janelas_15m_gold_rede(df_15m):
+    if df_15m is None or df_15m.empty:
+        return {
+            "labels": [], "timestamps": [],
+            "perda_local_pacotes": [], "perda_externa_pacotes": [], "latencia_externa_ms": [],
+            "conexoes_established_pct": [],
+            "volume_download_mb_m": [], "volume_upload_mb_m": [],
+            "pacotes_download_mil_m": [], "pacotes_upload_mil_m": [],
+            "historico_15m": [],
+        }
+
+    ultimas_5 = df_15m.tail(5).copy()
+    timestamps = [str(t) for t in ultimas_5["timestamp"].tolist()]
+    labels = [pd.to_datetime(t).strftime("%H:%M") for t in timestamps]
+    if labels:
+        labels[-1] = "Agora"
+
+    def _lista(col):
+        if col not in ultimas_5.columns:
+            return []
+        return [limpar_valor_json(v) for v in ultimas_5[col].tolist()]
+
+    ultimas_24h = df_15m.tail(96).drop(columns=["_ts"], errors="ignore")
+    hist_15m = [{k: limpar_valor_json(v) for k, v in r.items()} for r in ultimas_24h.to_dict(orient="records")]
+
+    return {
+        "labels": labels,
+        "timestamps": timestamps,
+        "perda_local_pacotes": _lista("rede_perda_pacotes_local"),
+        "perda_externa_pacotes": _lista("globalping_perda_pacotes"),
+        "latencia_externa_ms": _lista("globalping_latencia_ms"),
+        "conexoes_established_pct": _lista("rede_established_pct"),
+        "volume_download_mb_m": _lista("rede_download_mb_m"),
+        "volume_upload_mb_m": _lista("rede_upload_mb_m"),
+        "pacotes_download_mil_m": _lista("rede_download_mil_pacotes_m"),
+        "pacotes_upload_mil_m": _lista("rede_upload_mil_pacotes_m"),
+        "historico_15m": hist_15m,
+    }
+
+
 # SILVER (CSV) E GOLD (JSON)
 
 def gravar_silver(pasta_empresa, identificador, df):
@@ -673,6 +935,11 @@ def historico(df, campos):
 def montar_gold(df, processos_ram=None):
     ult = lambda c: ultimo_valido(df, c)
     est = lambda c: estatisticas_serie(df[c]) if c in df.columns else estatisticas_serie(pd.Series(dtype="float64"))
+    df_15m_rede = agregar_janelas_15m_rede(df)
+    janelas_rede = montar_janelas_15m_gold_rede(df_15m_rede)
+    tendencias_rede = calcular_tendencias_rede(df, df_15m_rede)
+    previsibilidade_rede = calcular_previsao_rede(df, df_15m_rede)
+    ult_15m = (lambda c: ultimo_valido(df_15m_rede, c) if not df_15m_rede.empty else ult(c))
 
     return {
         "empresa": {
@@ -785,19 +1052,50 @@ def montar_gold(df, processos_ram=None):
                     "time_wait": ult("rede_time_wait"),
                     "close_wait": ult("rede_close_wait"),
                     "total": ult("rede_conn_total"),
+                    "established_pct": ult("rede_established_pct"),
+                    "time_wait_pct": ult("rede_time_wait_pct"),
+                    "close_wait_pct": ult("rede_close_wait_pct"),
                 },
+                "perda_pacotes_local": ult_15m("rede_perda_pacotes_local"),
                 "perda_pacotes_pct": ult("rede_perda_pacotes_pct"),
                 "upload_bytes_s": ult("rede_upload_bytes_s"),
                 "download_bytes_s": ult("rede_download_bytes_s"),
+                "volume_download_mb_m": ult_15m("rede_download_mb_m"),
+                "volume_upload_mb_m": ult_15m("rede_upload_mb_m"),
+                "pacotes_download_mil_m": ult_15m("rede_download_mil_pacotes_m"),
+                "pacotes_upload_mil_m": ult_15m("rede_upload_mil_pacotes_m"),
             },
+            "globalping": {
+                "regiao": ult("globalping_regiao") or "BR",
+                "target_host": ult("globalping_target") or ult("ec2_public_ip"),
+                "latencia_externa_ms": ult("globalping_latencia_ms"),
+                "perda_externa_pacotes": ult("globalping_perda_pacotes"),
+                "perda_externa_pct": ult("globalping_perda_pct"),
+                "latencia_externa_graf": janelas_rede["latencia_externa_ms"],
+                "perda_externa_pacotes_graf": janelas_rede["perda_externa_pacotes"],
+            },
+            "janelas_15m": janelas_rede,
+            "tendencias": tendencias_rede,
+            "previsibilidade": previsibilidade_rede,
             "resumo": {
                 "upload_bytes_s": est("rede_upload_bytes_s"),
                 "download_bytes_s": est("rede_download_bytes_s"),
+                "volume_download_mb_m": est("rede_download_mb_m"),
+                "volume_upload_mb_m": est("rede_upload_mb_m"),
+                "pacotes_download_mil_m": est("rede_download_mil_pacotes_m"),
+                "pacotes_upload_mil_m": est("rede_upload_mil_pacotes_m"),
+                "perda_pacotes_local": est("rede_perda_pacotes_local"),
                 "perda_pacotes_pct": est("rede_perda_pacotes_pct"),
+                "latencia_externa_ms": est("globalping_latencia_ms"),
             },
             "historico": historico(df, [
-                "rede_upload_bytes_s", "rede_download_bytes_s", "rede_perda_pacotes_pct",
+                "rede_upload_bytes_s", "rede_download_bytes_s",
+                "rede_upload_mb_m", "rede_download_mb_m",
+                "rede_upload_mil_pacotes_m", "rede_download_mil_pacotes_m",
+                "rede_perda_pacotes_local", "rede_perda_pacotes_pct",
                 "rede_established", "rede_time_wait", "rede_close_wait", "rede_conn_total",
+                "rede_established_pct", "rede_time_wait_pct", "rede_close_wait_pct",
+                "globalping_latencia_ms", "globalping_perda_pct", "globalping_perda_pacotes",
             ]),
         },
     }

@@ -112,6 +112,11 @@ AWS_SESSION_TOKEN = config.get("AWS_SESSION_TOKEN", "")
 INTERVALO_UPLOAD_S = int(config.get("INTERVALO_UPLOAD_S", "300"))
 AWS_BUCKET_BRONZE = os.getenv("AWS_BUCKET_BRONZE", "").strip()
 
+# Configurações Globalping (1 requisição por janela de 15 minutos)
+GLOBALPING_TARGET = (config.get("GLOBALPING_TARGET") or os.getenv("GLOBALPING_TARGET") or "").strip()
+GLOBALPING_REGIAO = (config.get("GLOBALPING_REGIAO") or os.getenv("GLOBALPING_REGIAO") or "BR").strip()
+INTERVALO_GLOBALPING_S = int(config.get("INTERVALO_GLOBALPING_S") or os.getenv("INTERVALO_GLOBALPING_S") or "900")
+
 
 # ==========================================================================================
 # BANNER
@@ -254,6 +259,10 @@ HEADER_SISTEMA = [
 
     # Conexões ativas agregadas por estado
     "net_conn_total", "net_established", "net_time_wait", "net_close_wait", "net_none", "net_outros",
+
+    # Rota Externa (Globalping - 15m)
+    "ec2_public_ip", "globalping_regiao", "globalping_target",
+    "globalping_latencia_ms", "globalping_perda_pct", "globalping_perda_pacotes",
 ]
 
 HEADER_PARTICOES = [
@@ -422,7 +431,7 @@ def contar_conexoes_resumo():
     vazio = {"total": None, "established": None, "time_wait": None,
              "close_wait": None, "none": None, "outros": None}
     try:
-        conexoes = psutil.net_connections(kind="inet")
+        conexoes = psutil.net_connections(kind="tcp")
     except (psutil.AccessDenied, OSError, NotImplementedError):
         return vazio
     estados = {}
@@ -465,6 +474,7 @@ def obter_metadados_ec2(timeout=0.3):
     inst_type = _md("/meta-data/instance-type")
     az = _md("/meta-data/placement/availability-zone")
     tenancy = _md("/meta-data/placement/tenancy") or None
+    public_ip = _md("/meta-data/public-ipv4")
     doc = _md("/dynamic/instance-identity/document")
     region = None
     if doc:
@@ -480,8 +490,79 @@ def obter_metadados_ec2(timeout=0.3):
         "ec2_availability_zone": az,
         "ec2_region": region,
         "ec2_tenancy": tenancy,
+        "ec2_public_ip": public_ip,
         "_ec2_metadata_ok": bool(inst_id or inst_type)
     }
+
+
+_ultimo_globalping_ts = None
+_ultimo_globalping_dado = None
+
+
+def consultar_globalping_unico(target_host, regiao="BR"):
+    """Faz 1 única medição de ping na API Globalping e retorna um resultado consolidado."""
+    if not target_host:
+        return None
+    try:
+        payload = json.dumps({
+            "type": "ping",
+            "target": target_host,
+            "measurementOptions": {"packets": 16},
+            "locations": [{"country": regiao, "limit": 1}],
+        }).encode("utf-8")
+        req_create = urllib.request.Request(
+            "https://api.globalping.io/v1/measurements",
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "TrackCommerce-Captura/1.0"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_create, timeout=10) as resp:
+            criado = json.loads(resp.read().decode("utf-8"))
+        measurement_id = criado.get("id")
+        if not measurement_id:
+            return None
+
+        for _ in range(8):
+            time.sleep(0.6)
+            req_poll = urllib.request.Request(
+                f"https://api.globalping.io/v1/measurements/{measurement_id}",
+                headers={"User-Agent": "TrackCommerce-Captura/1.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req_poll, timeout=10) as resp_poll:
+                medicao = json.loads(resp_poll.read().decode("utf-8"))
+            if medicao.get("status") == "finished" and medicao.get("results"):
+                stats_list = [r.get("result", {}).get("stats") for r in medicao["results"] if r.get("result", {}).get("stats")]
+                if not stats_list:
+                    return None
+                latencia = round(sum(float(s.get("avg") or 0) for s in stats_list) / len(stats_list), 2)
+                perda_pct = round(sum(float(s.get("loss") or 0) for s in stats_list) / len(stats_list), 2)
+                perda_pacotes = int(sum(int(s.get("drop") or 0) for s in stats_list))
+                return {
+                    "regiao": regiao,
+                    "target": target_host,
+                    "latencia_ms": latencia,
+                    "perda_pct": perda_pct,
+                    "perda_pacotes": perda_pacotes,
+                }
+    except Exception as erro:
+        print(f"[AVISO Globalping] Falha ao consultar rota externa ({target_host}): {erro}")
+    return None
+
+
+def obter_globalping_15m(target_host, regiao="BR"):
+    """Garante no máximo 1 requisição ao Globalping por janela de 15 minutos."""
+    global _ultimo_globalping_ts, _ultimo_globalping_dado
+    if not target_host:
+        return None
+    agora = time.monotonic()
+    if _ultimo_globalping_ts is None or (agora - _ultimo_globalping_ts) >= INTERVALO_GLOBALPING_S:
+        resultado = consultar_globalping_unico(target_host, regiao)
+        _ultimo_globalping_ts = agora
+        if resultado is not None:
+            _ultimo_globalping_dado = resultado
+        return resultado
+    return _ultimo_globalping_dado
 
 
 def coletar_ciclo():
@@ -538,6 +619,8 @@ def coletar_ciclo():
         disk_gb = None
     md = obter_metadados_ec2()
     ec2_ok = md.get("_ec2_metadata_ok", False)
+    target_globalping = GLOBALPING_TARGET or md.get("ec2_public_ip")
+    gp = obter_globalping_15m(target_globalping, GLOBALPING_REGIAO) or {}
 
     dados = {
         "identifier": mach_uuid,
@@ -622,6 +705,13 @@ def coletar_ciclo():
         "net_conn_total": conexoes_resumo["total"], "net_established": conexoes_resumo["established"],
         "net_time_wait": conexoes_resumo["time_wait"], "net_close_wait": conexoes_resumo["close_wait"],
         "net_none": conexoes_resumo["none"], "net_outros": conexoes_resumo["outros"],
+
+        "ec2_public_ip": md.get("ec2_public_ip"),
+        "globalping_regiao": gp.get("regiao") if gp else (GLOBALPING_REGIAO if target_globalping else None),
+        "globalping_target": gp.get("target") if gp else target_globalping,
+        "globalping_latencia_ms": gp.get("latencia_ms"),
+        "globalping_perda_pct": gp.get("perda_pct"),
+        "globalping_perda_pacotes": gp.get("perda_pacotes"),
     }
 
     gravar_csv(arquivo_sistema, HEADER_SISTEMA, [[dados.get(c) for c in HEADER_SISTEMA]])
