@@ -1,2 +1,4 @@
 /track-commerce
 .env
+__pycache__
+
