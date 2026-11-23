@@ -11,15 +11,19 @@ Parar ao final (não executa automaticamente).
 """
 from __future__ import annotations
 import os, json, math, csv, traceback
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from statistics import median
+from dotenv import load_dotenv
 
-DIR_BASE = Path("./track-commerce")
+load_dotenv()
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DIR_BASE = Path(os.getenv("TRACKCOMMERCE_DIR")) if os.getenv("TRACKCOMMERCE_DIR") else (SCRIPT_DIR / "track-commerce")
 DIR_SILVER = DIR_BASE / "silver"
 DIR_GOLD_COSTS = DIR_BASE / "gold_costs"
-CACHE_FILE = Path("TrackCommerce-Captura/.pricing_cache.json")
-RATES_FILE = Path("TrackCommerce-Captura/instance_rates.json")  # usuário pode gerenciar
+CACHE_FILE = SCRIPT_DIR / ".pricing_cache.json"
+RATES_FILE = SCRIPT_DIR / "instance_rates.json"  # usuário pode gerenciar
 
 # Config / constantes
 HOURS_PER_MONTH = 730.0
@@ -30,6 +34,15 @@ FALLBACK_PER_GB_RAM_HOUR = float(os.getenv("FALLBACK_PER_GB_RAM_HOUR", "0.005"))
 FALLBACK_PER_GB_DISK_MONTH = float(os.getenv("FALLBACK_PER_GB_DISK_MONTH", "0.01"))
 
 AWS_BUCKET_GOLD = os.getenv("AWS_BUCKET_GOLD", "").strip()
+
+# mapeamento region_code -> location name usado pela AWS Pricing API
+REGION_TO_LOCATION = {
+    "us-east-1": "US East (N. Virginia)",
+    "us-west-2": "US West (Oregon)",
+    "eu-west-1": "EU (Ireland)",
+    "sa-east-1": "South America (Sao Paulo)",
+    "ap-southeast-1": "Asia Pacific (Singapore)",
+}
 
 try:
     import boto3
@@ -105,7 +118,7 @@ def pricing_lookup(instance_type: str, region_code: str, cache: dict) -> dict:
         price_hourly = parametric_estimate(instance_type)
         basis = "parametric_estimate"
 
-    cache[key] = {"hourly": price_hourly, "basis": basis, "ts": datetime.utcnow().isoformat()}
+    cache[key] = {"hourly": price_hourly, "basis": basis, "ts": datetime.now(timezone.utc).isoformat()}
     save_cache(cache)
     return {"hourly": price_hourly, "basis": basis}
 
@@ -125,37 +138,13 @@ def parametric_estimate(instance_type: str = None, vcpus: int | None = None, ram
     return round(hourly, 6)
 
 
-def load_instance_rates_from_file():
-    """Fallback: carrega rates de arquivo JSON se o banco não estiver disponível."""
-    if not RATES_FILE.exists():
-        return {}
-    try:
-        return json.loads(RATES_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def pick_rate_for_date(rates_list: list, target_date: date):
-    if not rates_list:
-        return None
-    best = None
-    for rec in rates_list:
-        try:
-            eff = datetime.strptime(rec.get("effective_from"), "%Y-%m-%d").date()
-        except Exception:
-            continue
-        if eff <= target_date:
-            if best is None or eff > best[0]:
-                best = (eff, rec.get("value_per_established"))
-    return best[1] if best else None
-
-
 def get_rate_from_db(identifier: str, target_date: date):
     """Consulta o banco para obter o valor vigente por 'Established' para a instância."""
     db_host = os.getenv("DB_HOST")
     db_user = os.getenv("DB_USER")
-    db_pass = os.getenv("DB_PASS")
-    db_name = os.getenv("DB_NAME")
+    # aceitar nomes alternativos para compatibilidade com o frontend/backend
+    db_pass = os.getenv("DB_PASS") or os.getenv("DB_PASSWORD")
+    db_name = os.getenv("DB_NAME") or os.getenv("DB_DATABASE")
     if not (db_host and db_user and db_pass and db_name):
         return None
     try:
@@ -167,12 +156,12 @@ def get_rate_from_db(identifier: str, target_date: date):
     try:
         cursor = conn.cursor()
         # tentar match exato pelo identificador
-        cursor.execute("SELECT id_instancia FROM Instancias WHERE identificador = %s LIMIT 1", (identifier,))
+        cursor.execute("SELECT id_instancia FROM instancia WHERE identificador = %s LIMIT 1", (identifier,))
         row = cursor.fetchone()
         if not row:
             # tentar normalizado (remover - e _)
             norm = identifier.replace("-", "").replace("_", "").lower()
-            cursor.execute("SELECT id_instancia, identificador FROM Instancias")
+            cursor.execute("SELECT id_instancia, identificador FROM instancia")
             rows = cursor.fetchall()
             found = None
             for r in rows:
@@ -188,8 +177,8 @@ def get_rate_from_db(identifier: str, target_date: date):
         else:
             inst_id = row[0]
 
-        # Primeiro, verificar se existe override direto na tabela Instancias.valor_por_established
-        cursor.execute("SELECT valor_por_established FROM Instancias WHERE id_instancia = %s LIMIT 1", (inst_id,))
+        # Ler valor_por_established direto na tabela instancia (coluna adicionada no schema)
+        cursor.execute("SELECT valor_por_established FROM instancia WHERE id_instancia = %s LIMIT 1", (inst_id,))
         rr = cursor.fetchone()
         if rr and rr[0] is not None:
             try:
@@ -202,31 +191,7 @@ def get_rate_from_db(identifier: str, target_date: date):
             conn.close()
         except Exception:
             pass
-
-
-def get_rate_from_history_file(empresa: str, identifier: str, target_date: date):
-    """Busca no arquivo ./track-commerce/gold/<empresa>/pricing_history.json o último rate_used com date <= target_date."""
-    try:
-        hist_path = DIR_BASE / "gold" / empresa / "pricing_history.json"
-        if not hist_path.exists():
-            return None
-        hist = json.loads(hist_path.read_text(encoding="utf-8"))
-        # localizar instancia
-        for inst in hist.get("instancias", []):
-            if inst.get("instancia") == identifier:
-                best = None
-                for rec in inst.get("historico_precos", []):
-                    try:
-                        d = datetime.fromisoformat(rec.get("date")).date()
-                    except Exception:
-                        continue
-                    if d <= target_date:
-                        if best is None or d > best[0]:
-                            best = (d, rec.get("rate_used"))
-                return best[1] if best else None
-        return None
-    except Exception:
-        return None
+ 
 
 
 def analyze_silver_for_instance(silver_path: Path, report_date: date):
@@ -255,7 +220,7 @@ def analyze_silver_for_instance(silver_path: Path, report_date: date):
                 pass
             if vcpus is None:
                 try:
-                    vcpus = int(r.get("vcpus") or r.get("cpu_count_logical"))
+                    vcpus = int(r.get("vcpus") or r.get("cpu_nucleos_logicos") or r.get("cpu_count_logical"))
                 except Exception:
                     vcpus = vcpus
             if ram_gb is None:
@@ -344,12 +309,26 @@ def compute_costs_for_instance(info: dict, pricing_res: dict, rate_used: float, 
     }
 
 
-def upload_to_s3_local(path: Path, bucket: str, key: str):
+# upload_to_s3_local removed: direct S3 put_object is used instead; fallback writes local files when needed.
+
+
+def s3_get_json(bucket: str, key: str):
+    if not boto3 or not bucket:
+        return None
+    try:
+        s3 = boto3.client("s3")
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def s3_put_json(bucket: str, key: str, obj: dict):
     if not boto3 or not bucket:
         return False
     try:
         s3 = boto3.client("s3")
-        s3.upload_file(str(path), bucket, key)
+        s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"), ContentType="application/json")
         return True
     except Exception:
         return False
@@ -358,7 +337,6 @@ def upload_to_s3_local(path: Path, bucket: str, key: str):
 def main(report_date: date | None = None):
     report_date = report_date or date.today() - timedelta(days=1)  # geralmente rodar para dia anterior
     cache = load_cache()
-    rates = load_instance_rates_from_file()
     DIR_GOLD_COSTS.mkdir(parents=True, exist_ok=True)
     results = []
 
@@ -383,15 +361,9 @@ def main(report_date: date | None = None):
                 region_code = info.get("ec2_region")
 
                 pricing_res = pricing_lookup(inst_type or "", region_code or "", cache)
-                # obter rate: primeiro procurar histórico em GOLD, depois coluna Instancias, depois arquivo/default
-                rate_used = get_rate_from_history_file(empresa, identifier, report_date)
-                if rate_used is None:
-                    rate_used = get_rate_from_db(identifier, report_date)
-                if rate_used is None:
-                    rate_list = rates.get(identifier) or []
-                    rate_used = pick_rate_for_date(rate_list, report_date)
-                if rate_used is None:
-                    rate_used = DEFAULT_VALUE_PER_ESTABLISHED
+                # obter rate exclusivamente a partir do BD (instancia.valor_por_established)
+                rate_used = get_rate_from_db(identifier, report_date)
+                # se o BD estiver indisponível (rate_used is None), não aplicar fallback a fontes alternativas
                 critical_factor = DEFAULT_CRITICAL_FACTOR
                 costs = compute_costs_for_instance(info, pricing_res, rate_used, critical_factor)
 
@@ -405,22 +377,42 @@ def main(report_date: date | None = None):
                     "critical_factor": critical_factor,
                     "costs": costs,
                 }
-                out_path = out_dir / f"{identifier}_downtime_{report_date.isoformat()}.json"
-                out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-                # --- atualizar histórico consolidado por empresa em GOLD ---
+                # prepare payload json bytes and upload directly to S3 (no local file)
+                key = f"{empresa}/{identifier}_downtime_{report_date.isoformat()}.json"
+                body = json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8")
+                uploaded = False
+                if boto3 and AWS_BUCKET_GOLD:
+                    try:
+                        s3 = boto3.client("s3")
+                        s3.put_object(Bucket=AWS_BUCKET_GOLD, Key=key, Body=body, ContentType="application/json")
+                        uploaded = True
+                    except Exception:
+                        uploaded = False
+                if not uploaded:
+                    # fallback: persist locally if S3 unavailable (keeps previous behaviour safe)
+                    out_path = out_dir / f"{identifier}_downtime_{report_date.isoformat()}.json"
+                    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+                    key = f"{empresa}/{out_path.name}"
+
+                # --- atualizar histórico consolidado por empresa em GOLD (in-memory then S3) ---
                 try:
-                    gold_dir = DIR_BASE / "gold" / empresa
-                    gold_dir.mkdir(parents=True, exist_ok=True)
-                    hist_path = gold_dir / "pricing_history.json"
-                    if hist_path.exists():
-                        hist = json.loads(hist_path.read_text(encoding="utf-8"))
-                    else:
-                        hist = {"empresa": empresa, "instancias": []}
+                    hist_key = f"{empresa}/pricing_history.json"
+                    hist = s3_get_json(AWS_BUCKET_GOLD, hist_key) if boto3 and AWS_BUCKET_GOLD else None
+                    if hist is None:
+                        # try local file as fallback
+                        gold_dir = DIR_BASE / "gold" / empresa
+                        hist_path = gold_dir / "pricing_history.json"
+                        if hist_path.exists():
+                            hist = json.loads(hist_path.read_text(encoding="utf-8"))
+                        else:
+                            hist = {"empresa": empresa, "instancias": []}
 
                     # localizar ou criar entrada para a instancia
                     inst_entry = None
                     for e in hist["instancias"]:
-                        if e.get("instancia") == identifier:
+                        inst_name = (e.get("instancia", "") or "").replace("-", "").replace("_", "").lower()
+                        inst_id_norm = identifier.replace("-", "").replace("_", "").lower()
+                        if inst_name == inst_id_norm:
                             inst_entry = e
                             break
                     if inst_entry is None:
@@ -436,17 +428,18 @@ def main(report_date: date | None = None):
                         "calculation_basis": costs.get("calculation_basis"),
                     }
                     inst_entry["historico_precos"].append(hist_record)
-                    hist_path.write_text(json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
+
+                    # upload consolidated history to S3 if possible, else write local
+                    if boto3 and AWS_BUCKET_GOLD:
+                        s3_put_json(AWS_BUCKET_GOLD, hist_key, hist)
+                    else:
+                        gold_dir = DIR_BASE / "gold" / empresa
+                        gold_dir.mkdir(parents=True, exist_ok=True)
+                        hist_path = gold_dir / "pricing_history.json"
+                        hist_path.write_text(json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
-                # optional upload
-                if AWS_BUCKET_GOLD and boto3:
-                    key = f"{empresa}/{out_path.name}"
-                    try:
-                        upload_to_s3_local(out_path, AWS_BUCKET_GOLD, out_path.name)
-                    except Exception:
-                        pass
-                results.append(out_path)
+                results.append(key)
             except Exception:
                 print(f"Falha ao processar {csvfile}:")
                 traceback.print_exc()
@@ -454,14 +447,7 @@ def main(report_date: date | None = None):
     print(f"Concluído: {len(results)} relatórios gerados em {DIR_GOLD_COSTS}")
 
 
-# mapagem básica region_code -> location_name usada pelo pricing API (amostral)
-REGION_TO_LOCATION = {
-    "us-east-1": "US East (N. Virginia)",
-    "us-west-2": "US West (Oregon)",
-    "eu-west-1": "EU (Ireland)",
-    "sa-east-1": "South America (Sao Paulo)",
-    "ap-southeast-1": "Asia Pacific (Singapore)",
-}
+# (REGION_TO_LOCATION defined in constants above)
 
 if __name__ == "__main__":
     main()
