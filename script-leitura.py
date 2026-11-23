@@ -477,7 +477,6 @@ def transformar_dataframe(df_bronze, empresa):
         "ec2_region": df["ec2_region"].apply(para_texto) if "ec2_region" in df.columns else None,
         "ec2_operating_system": df["ec2_operating_system"].apply(para_texto) if "ec2_operating_system" in df.columns else None,
         "ec2_license_model": df["ec2_license_model"].apply(para_texto) if "ec2_license_model" in df.columns else None,
-        "declared_monthly_cost": pd.to_numeric(df["declared_monthly_cost"], errors="coerce") if "declared_monthly_cost" in df.columns else None,
         "globalping_regiao": df["globalping_regiao"].apply(para_texto) if "globalping_regiao" in df.columns else None,
         "globalping_target": df["globalping_target"].apply(para_texto) if "globalping_target" in df.columns else None,
         "globalping_latencia_ms": col_pos(df, "globalping_latencia_ms").round(2),
