@@ -18,7 +18,7 @@ import uuid
 
 # Importação do dotenv para carregamento de configurações do arquivo .env
 try:
-    from dotenv import dotenv_values, load_dotenv
+    from dotenv import load_dotenv
 except ImportError as erro:
     print(f"\n{'=' * 100}\nErro ao carregar a biblioteca python-dotenv: {erro}\nInstale com: pip install python-dotenv\n{'=' * 100}")
     sys.exit(1)
@@ -51,19 +51,7 @@ def obter_regiao_instancia():
         return None
 
 
-
 # configuração
-
-
-INTERVALO_COLETA = 1       # segundos de espera entre ciclos
-INTERVALO_CPU = 1          # segundos de medição do uso de CPU (bloqueante)
-TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
-
-# Partições ignoradas no monitoramento
-FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"} # Partições não especificadas no arquivo de Capturas de Métricas e no Figma
-
-
-
 #diretório padrão da aplicação
 
 
@@ -80,10 +68,8 @@ os.chdir(DIR_APP)
 # Carrega as variáveis do arquivo .env localizado no diretório da aplicação
 caminho_env = os.path.join(DIR_APP, ".env")
 load_dotenv(dotenv_path=caminho_env)
-config = dotenv_values(caminho_env)
-
-TOKEN_INSTALACAO = config.get("TOKEN_INSTALACAO", "").strip()
-API_BASE_URL = config.get("API_BASE_URL", "http://localhost:3333").rstrip("/")
+TOKEN_INSTALACAO = os.getenv("TOKEN_INSTALACAO", "").strip()
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:3333").rstrip("/")
 
 DIR_BRONZE = os.path.join(DIR_APP, "track-commerce", "bronze")
 os.makedirs(DIR_BRONZE, exist_ok=True)
@@ -104,18 +90,25 @@ FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"
 _regiao_detectada = obter_regiao_instancia()
 regiao_instancia = _regiao_detectada or "Desconhecida"
 
-AWS_ENVIAR = config.get("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
-AWS_REGION = config.get("AWS_REGION") or os.getenv("AWS_REGION") or _regiao_detectada or "us-east-1"
-AWS_ACCESS_KEY_ID = config.get("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = config.get("AWS_SECRET_ACCESS_KEY", "")
-AWS_SESSION_TOKEN = config.get("AWS_SESSION_TOKEN", "")
-INTERVALO_UPLOAD_S = int(config.get("INTERVALO_UPLOAD_S", "300"))
+AWS_ENVIAR = os.getenv("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
+AWS_REGION = os.getenv("AWS_REGION") or _regiao_detectada or "us-east-1"
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
+INTERVALO_UPLOAD_S = int(os.getenv("INTERVALO_UPLOAD_S", "300"))
 AWS_BUCKET_BRONZE = os.getenv("AWS_BUCKET_BRONZE", "").strip()
+DECLARED_MONTHLY_COST = None
+_decl = os.getenv("DECLARED_MONTHLY_COST", "").strip()
+if _decl:
+    try:
+        DECLARED_MONTHLY_COST = float(_decl)
+    except Exception:
+        DECLARED_MONTHLY_COST = None
 
 # Configurações Globalping (1 requisição por janela de 15 minutos)
-GLOBALPING_TARGET = (config.get("GLOBALPING_TARGET") or os.getenv("GLOBALPING_TARGET") or "").strip()
-GLOBALPING_REGIAO = (config.get("GLOBALPING_REGIAO") or os.getenv("GLOBALPING_REGIAO") or "BR").strip()
-INTERVALO_GLOBALPING_S = int(config.get("INTERVALO_GLOBALPING_S") or os.getenv("INTERVALO_GLOBALPING_S") or "900")
+GLOBALPING_TARGET = os.getenv("GLOBALPING_TARGET", "").strip()
+GLOBALPING_REGIAO = os.getenv("GLOBALPING_REGIAO", "BR").strip()
+INTERVALO_GLOBALPING_S = int(os.getenv("INTERVALO_GLOBALPING_S", "900"))
 
 
 # ==========================================================================================
@@ -227,6 +220,7 @@ HEADER_SISTEMA = [
     "vcpus", "ram_gb", "disk_gb",
     "ec2_instance_id", "ec2_instance_type", "ec2_availability_zone", "ec2_region",
     "ec2_tenancy", "ec2_license_model", "hardware_payload_source",
+    "declared_monthly_cost",
 
     # CPU
     "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
@@ -476,6 +470,7 @@ def obter_metadados_ec2(timeout=0.3):
     tenancy = _md("/meta-data/placement/tenancy") or None
     public_ip = _md("/meta-data/public-ipv4")
     doc = _md("/dynamic/instance-identity/document")
+    platform_meta = _md("/meta-data/platform")
     region = None
     if doc:
         try:
@@ -490,6 +485,7 @@ def obter_metadados_ec2(timeout=0.3):
         "ec2_availability_zone": az,
         "ec2_region": region,
         "ec2_tenancy": tenancy,
+        "platform": platform_meta,
         "ec2_public_ip": public_ip,
         "_ec2_metadata_ok": bool(inst_id or inst_type)
     }
@@ -644,10 +640,14 @@ def coletar_ciclo():
         "ec2_tenancy": md.get("ec2_tenancy"),
         "ec2_license_model": None,
         # operacional system and preinstalled software hints for Pricing API
-        "ec2_operating_system": ( "Windows" if platform.system().lower().startswith("win") else
-                                  (md.get("platform") or platform.system()) ),
+        "ec2_operating_system": (
+            "Windows" if platform.system().lower().startswith("win") else
+            ("Linux" if platform.system().lower().startswith("linux") else platform.system())
+        ),
         "ec2_preinstalled_sw": None,
         "hardware_payload_source": "imds" if ec2_ok else "local_psutil",
+        # optional declared monthly cost provided via environment variable (float) or None
+        "declared_monthly_cost": DECLARED_MONTHLY_COST,
 
         "cpu_percent": cpu_percent,
         "cpu_por_nucleo": "|".join(str(v) for v in por_nucleo),
