@@ -1,18 +1,19 @@
 """
 ==========================================================================================
- TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD) - VERSÃO CORRIGIDA
+ TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD) - AWS LAMBDA (PYTHON 3.12)
 ==========================================================================================
 
- Entrada : ./track-commerce/bronze/*.csv (ou via S3 Bucket)
+ Entrada : Evento S3 (Bucket Bronze) no AWS Lambda ou ./track-commerce/bronze/*.csv (local)
  Saída   :
    SILVER (Análise R - inclui empresa_id e empresa_nome em todas as linhas e caminhos)
-     ./track-commerce/silver/<empresa_id>/<identificador>_sistema.csv
+     <pasta_empresa>/<identificador>_sistema.csv
    GOLD   (JSON estruturado com histórico completo)
-     ./track-commerce/gold/<empresa_id>/<identificador>_sistema.json
-     ./track-commerce/gold/<empresa_id>/indice_maquinas.json
-     ./track-commerce/gold/indice_maquinas.json
+     <pasta_empresa>/<identificador>_sistema.json
+     indice_maquinas_empresa_<pasta_empresa>.json
+     indice_maquinas.json
 
-Usa pandas + python-dotenv + mysql.connector (opcional BD) + boto3 (opcional S3).
+ Usa pandas (Layer AWSSDKPandas-Python312 no Lambda) + boto3 (nativo no Lambda)
+ + python-dotenv e mysql.connector (opcionais).
 ==========================================================================================
 """
 
@@ -21,27 +22,43 @@ Usa pandas + python-dotenv + mysql.connector (opcional BD) + boto3 (opcional S3)
 import glob
 import json
 import os
+import shutil
 from datetime import datetime
+from urllib.parse import unquote_plus
 
-
-import mysql.connector
 import pandas as pd
-from dotenv import load_dotenv
+
+try:
+    import mysql.connector as mysql_connector
+except ImportError:
+    mysql_connector = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 try:
     import boto3
+    from botocore.exceptions import ClientError
 except ImportError:
     boto3 = None
+    ClientError = Exception
 
 # ==========================================================================================
 # CONFIGURAÇÕES E INTEGRAÇÕES
 # ==========================================================================================
+EM_LAMBDA = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+
 # Resolver .env relativo ao diretório do script antes de ler variáveis de ambiente
 BASE_DIR_PROJETO = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR_PROJETO, ".env"))
+if load_dotenv is not None:
+    load_dotenv(os.path.join(BASE_DIR_PROJETO, ".env"))
 
-# permitir override por variável de ambiente
-DIR_BASE = os.getenv("TRACKCOMMERCE_DIR") or os.path.join(BASE_DIR_PROJETO, "track-commerce")
+# No AWS Lambda, apenas /tmp permite escrita
+DIR_BASE = os.getenv("TRACKCOMMERCE_DIR") or (
+    "/tmp/track-commerce" if EM_LAMBDA else os.path.join(BASE_DIR_PROJETO, "track-commerce")
+)
 DIR_BRONZE = os.path.join(DIR_BASE, "bronze")
 DIR_SILVER = os.path.join(DIR_BASE, "silver")
 DIR_GOLD = os.path.join(DIR_BASE, "gold")
@@ -58,10 +75,10 @@ LIMITE_RAM_CRITICO = 85.0
 
 COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
 
-# S3 Download / Upload (Opcional)
+# S3 Download / Upload (no Lambda, upload vem habilitado por padrão)
 AWS_BAIXAR = os.getenv("AWS_BAIXAR", "False").lower() in ("true", "1", "t", "yes")
-AWS_UPLOAD = os.getenv("AWS_UPLOAD", "False").lower() in ("true", "1", "t", "yes")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_UPLOAD = os.getenv("AWS_UPLOAD", "True" if EM_LAMBDA else "False").lower() in ("true", "1", "t", "yes")
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
@@ -79,16 +96,29 @@ METRICAS_DESVIO = [
 
 # AWS S3 E BANCO DE DADOS
 
+_cliente_s3_cache = None
+
+
 def obter_cliente_s3():
-    if not (boto3 and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+    global _cliente_s3_cache
+    if not boto3:
         return None
-    return boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        aws_session_token=AWS_SESSION_TOKEN or None,
-        region_name=AWS_REGION,
-    )
+    if _cliente_s3_cache is not None:
+        return _cliente_s3_cache
+
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        _cliente_s3_cache = boto3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            aws_session_token=AWS_SESSION_TOKEN or None,
+            region_name=AWS_REGION,
+        )
+    else:
+        # No AWS Lambda (ou EC2 com IAM Role), usa automaticamente as credenciais da Role
+        _cliente_s3_cache = boto3.client("s3", region_name=AWS_REGION)
+    return _cliente_s3_cache
+
 
 def baixar_bronze_s3():
     """Baixa automaticamente os CSVs do S3 para a pasta local bronze antes do processamento."""
@@ -126,41 +156,77 @@ def baixar_bronze_s3():
     except Exception as erro:
         print(f"  [ERRO S3 DOWNLOAD] Falha ao sincronizar com S3: {erro}")
 
-def enviar_para_s3(caminho_local, chave_s3, bucket, documento=None):
-    """Faz o upload de um arquivo local para o bucket S3."""
+
+def enviar_para_s3(caminho_local, chave_s3, bucket, documento=None, propagar_erro=False):
+    """Faz o upload de um arquivo local ou documento JSON para o bucket S3."""
     if not AWS_UPLOAD:
         return
-    
+
     s3 = obter_cliente_s3()
     if not s3:
+        if propagar_erro:
+            raise RuntimeError("Cliente boto3 indisponível para envio ao S3.")
         return
 
     try:
         if documento is None:
             s3.upload_file(caminho_local, bucket, chave_s3)
         else:
-            s3.put_object(Bucket=bucket, Key=chave_s3, ContentType="application/json",
-                          Body=json.dumps(documento, ensure_ascii=False).encode("utf-8"))
-        print(f"  [S3 UPLOAD] Enviado: {chave_s3}")
+            s3.put_object(
+                Bucket=bucket,
+                Key=chave_s3,
+                ContentType="application/json",
+                Body=json.dumps(documento, ensure_ascii=False).encode("utf-8"),
+            )
+        print(f"  [S3 UPLOAD] Enviado: s3://{bucket}/{chave_s3}")
     except Exception as erro:
-        print(f"  [ERRO S3 UPLOAD] Falha ao enviar {caminho_local}: {erro}")
+        print(f"  [ERRO S3 UPLOAD] Falha ao enviar {chave_s3} para {bucket}: {erro}")
+        if propagar_erro:
+            raise
+
+
+def ler_json_s3(s3, bucket, chave):
+    """Lê um JSON existente no S3; retorna None se não existir ou estiver inválido."""
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=chave)
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except ClientError as erro:
+        codigo = erro.response.get("Error", {}).get("Code", "")
+        if codigo in ("NoSuchKey", "404", "NotFound"):
+            return None
+        print(f"  [AVISO S3 LEITURA] Falha ao ler s3://{bucket}/{chave}: {erro}")
+        return None
+    except Exception as erro:
+        print(f"  [AVISO S3 LEITURA] Conteúdo inválido em s3://{bucket}/{chave}: {erro}")
+        return None
 
 
 def carregar_maquinas_bd():
-    """Busca no BD o vínculo máquina -> empresa. Se inacessível, retorna {}."""
+    """Busca no BD o vínculo máquina -> empresa. Se inacessível ou não configurado, retorna {}."""
+    if mysql_connector is None:
+        print("[INFO BD] mysql-connector não instalado; utilizando metadados do Bronze.")
+        return {}
+
+    db_host = os.getenv("DB_HOST", "").strip()
+    if not db_host:
+        print("[INFO BD] DB_HOST não configurado; utilizando metadados do Bronze.")
+        return {}
+
     try:
-        db_host = os.getenv("DB_HOST")
         db_user = os.getenv("DB_USER")
         # aceitar nomes alternativos usados em outros componentes
         db_pass = os.getenv("DB_PASS") or os.getenv("DB_PASSWORD")
         db_name = os.getenv("DB_NAME") or os.getenv("DB_DATABASE")
-        conexao = mysql.connector.connect(
+        db_port = int(os.getenv("DB_PORT", "3306"))
+        conexao = mysql_connector.connect(
             host=db_host,
+            port=db_port,
             user=db_user,
             password=db_pass,
             database=db_name,
+            connection_timeout=5,
         )
-    except mysql.connector.Error as erro:
+    except Exception as erro:
         print(f"[AVISO BD] Indisponível, utilizando dados de empresa do Bronze: {erro}")
         return {}
     try:
@@ -1059,7 +1125,298 @@ def montar_gold(df, processos_ram=None):
         },
     }
 
-# EXECUÇÃO
+# EXECUÇÃO AWS LAMBDA (ORIENTADA A EVENTO S3 NO BUCKET BRONZE)
+
+
+def _limpar_dir_temporario():
+    """Limpa o diretório /tmp usado pelo ETL entre invocações warm do Lambda."""
+    if DIR_BASE.startswith("/tmp") and os.path.isdir(DIR_BASE):
+        shutil.rmtree(DIR_BASE, ignore_errors=True)
+
+
+def _mesclar_indice_empresa(indice_atual, empresa_id, empresa_nome, entrada_maquina):
+    """Atualiza ou insere a máquina no índice S3 da empresa preservando as demais."""
+    if not isinstance(indice_atual, dict):
+        indice_atual = {}
+
+    maquinas_existentes = indice_atual.get("maquinas")
+    if not isinstance(maquinas_existentes, list):
+        maquinas_existentes = []
+
+    alvo = normalizar_identificador(entrada_maquina.get("identifier"))
+    atualizadas = []
+    substituida = False
+
+    for maq in maquinas_existentes:
+        if isinstance(maq, dict) and normalizar_identificador(maq.get("identifier")) == alvo:
+            atualizadas.append(entrada_maquina)
+            substituida = True
+        else:
+            atualizadas.append(maq)
+
+    if not substituida:
+        atualizadas.append(entrada_maquina)
+
+    return {
+        "empresa_id": empresa_id,
+        "empresa_nome": empresa_nome,
+        "maquinas": atualizadas,
+    }
+
+
+def _mesclar_indice_global(indice_global_atual, grupo_empresa):
+    """Atualiza ou insere a empresa no índice global S3 preservando as demais."""
+    empresas_existentes = []
+    if isinstance(indice_global_atual, dict) and isinstance(indice_global_atual.get("empresas"), list):
+        empresas_existentes = indice_global_atual["empresas"]
+
+    alvo_emp = nome_seguro(grupo_empresa.get("empresa_id"))
+    atualizadas = []
+    substituida = False
+
+    for emp in empresas_existentes:
+        if isinstance(emp, dict) and nome_seguro(emp.get("empresa_id")) == alvo_emp:
+            atualizadas.append(grupo_empresa)
+            substituida = True
+        else:
+            atualizadas.append(emp)
+
+    if not substituida:
+        atualizadas.append(grupo_empresa)
+
+    return {"empresas": atualizadas}
+
+
+def _baixar_objeto_s3_opcional(s3, bucket, chave, destino):
+    """Baixa um objeto do S3 para destino. Retorna False se o objeto não existir."""
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    try:
+        s3.download_file(bucket, chave, destino)
+        print(f"  [S3 DOWNLOAD] s3://{bucket}/{chave} -> {destino}")
+        return True
+    except ClientError as erro:
+        codigo = erro.response.get("Error", {}).get("Code", "")
+        if codigo in ("NoSuchKey", "404", "NotFound"):
+            return False
+        raise
+
+
+def _resolver_chaves_evento_bronze(chave_s3):
+    """
+    A partir da chave recebida no Bucket Bronze, determina:
+    - se o arquivo deve ser ignorado;
+    - a chave do CSV de sistema e a chave opcional do CSV de processos.
+    """
+    if not chave_s3 or not chave_s3.lower().endswith(".csv"):
+        return None, None, "nao_csv"
+
+    nome_arq = os.path.basename(chave_s3)
+    prefixo = os.path.dirname(chave_s3)
+
+    if nome_arq.endswith("_particoes.csv") or nome_arq.endswith("_conexoes_rede.csv"):
+        return None, None, "arquivo_auxiliar_ignorado"
+
+    if nome_arq.endswith("_processos.csv"):
+        nome_sistema = nome_arq.replace("_processos.csv", "_sistema.csv")
+        chave_sistema = f"{prefixo}/{nome_sistema}" if prefixo else nome_sistema
+        return chave_sistema, chave_s3, "processos"
+
+    if nome_arq.endswith("_sistema.csv"):
+        nome_proc = nome_arq.replace("_sistema.csv", "_processos.csv")
+        chave_proc = f"{prefixo}/{nome_proc}" if prefixo else nome_proc
+        return chave_s3, chave_proc, "sistema"
+
+    return chave_s3, None, "csv_generico"
+
+
+def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_silver, bucket_gold):
+    """Processa um arquivo recebido do Bucket Bronze e grava Silver, Gold e índices no S3."""
+    chave_sistema, chave_processos, tipo = _resolver_chaves_evento_bronze(chave_s3)
+    if not chave_sistema:
+        print(f"[LAMBDA] Ignorando objeto '{chave_s3}' ({tipo}).")
+        return {"chave": chave_s3, "status": "ignorado", "motivo": tipo}
+
+    destino_sistema = os.path.join(DIR_BRONZE, chave_sistema.lstrip("/"))
+    baixou_sistema = _baixar_objeto_s3_opcional(s3, bucket_bronze, chave_sistema, destino_sistema)
+    if not baixou_sistema:
+        print(f"[LAMBDA] Arquivo de sistema '{chave_sistema}' ainda não encontrado no Bronze.")
+        return {"chave": chave_s3, "status": "ignorado", "motivo": "sistema_nao_encontrado"}
+
+    caminhos_processos = []
+    if chave_processos:
+        destino_proc = os.path.join(DIR_BRONZE, chave_processos.lstrip("/"))
+        if _baixar_objeto_s3_opcional(s3, bucket_bronze, chave_processos, destino_proc):
+            caminhos_processos.append(destino_proc)
+
+    df_lido = ler_bronze(destino_sistema)
+    if df_lido.empty:
+        print(f"[LAMBDA] Nenhuma linha válida encontrada em '{chave_sistema}'.")
+        return {"chave": chave_s3, "status": "ignorado", "motivo": "csv_vazio_ou_invalido"}
+
+    os.makedirs(DIR_SILVER, exist_ok=True)
+    os.makedirs(DIR_GOLD, exist_ok=True)
+
+    prefixo_empresa = chave_sistema.split("/", 1)[0] if "/" in chave_sistema else None
+    maquinas_processadas = []
+
+    for ident_raw, df_bronze in df_lido.groupby("identifier"):
+        identificador = normalizar_identificador(ident_raw)
+        if not identificador:
+            continue
+
+        df_bronze = (
+            df_bronze.sort_values("_ts")
+            .drop_duplicates(subset=["identifier", "_ts"], keep="last")
+            .reset_index(drop=True)
+        )
+
+        empresa_id = (
+            mapa_bd.get(identificador, {}).get("empresa_id")
+            or ultimo_valido_bronze(df_bronze, "enterprise_identifier", "empresa_id")
+            or prefixo_empresa
+            or "sem_empresa"
+        )
+        empresa_nome = (
+            mapa_bd.get(identificador, {}).get("empresa_nome")
+            or ultimo_valido_bronze(df_bronze, "enterprise_reason", "empresa_nome")
+            or "Empresa Desconhecida"
+        )
+        vm_nome = mapa_bd.get(identificador, {}).get("vm_nome")
+
+        empresa = {
+            "empresa_id": empresa_id,
+            "empresa_nome": empresa_nome,
+            "vm_nome": vm_nome,
+        }
+
+        df_tratado = transformar_dataframe(df_bronze, empresa)
+        if df_tratado.empty:
+            continue
+
+        nome = nome_seguro(identificador)
+        pasta_empresa = nome_seguro(empresa_id)
+
+        # 1. Silver -> S3 Silver
+        caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado)
+        chave_s3_silver = f"{pasta_empresa}/{os.path.basename(caminho_silver)}"
+        enviar_para_s3(caminho_silver, chave_s3_silver, bucket=bucket_silver, propagar_erro=True)
+
+        # 2. Gold -> S3 Gold
+        proc_ram = processar_processos_ram(caminhos_processos)
+        gold = montar_gold(df_tratado, processos_ram=proc_ram)
+
+        nome_arquivo_gold = f"{nome}_sistema.json"
+        chave_s3_gold = f"{pasta_empresa}/{nome_arquivo_gold}"
+        enviar_para_s3(None, chave_s3_gold, bucket=bucket_gold, documento=gold, propagar_erro=True)
+
+        # 3. Atualização incremental dos índices no S3 Gold
+        entrada_maquina_s3 = {
+            **gold["maquina"],
+            "arquivo": nome_arquivo_gold,
+            "cpu_percent": gold["cpu"]["atual"]["uso_percent"],
+            "ram_percent": gold["ram"]["atual"]["uso_percent"],
+            "disco_percent": gold["disco"]["atual"]["uso_percent"],
+        }
+
+        chave_indice_emp = f"indice_maquinas_empresa_{pasta_empresa}.json"
+        indice_emp_atual = ler_json_s3(s3, bucket_gold, chave_indice_emp)
+        grupo_s3 = _mesclar_indice_empresa(indice_emp_atual, empresa_id, empresa_nome, entrada_maquina_s3)
+        enviar_para_s3(None, chave_indice_emp, bucket=bucket_gold, documento=grupo_s3, propagar_erro=True)
+
+        chave_indice_global = "indice_maquinas.json"
+        indice_global_atual = ler_json_s3(s3, bucket_gold, chave_indice_global)
+        indice_global_novo = _mesclar_indice_global(indice_global_atual, grupo_s3)
+        enviar_para_s3(None, chave_indice_global, bucket=bucket_gold, documento=indice_global_novo, propagar_erro=True)
+
+        maquinas_processadas.append({
+            "identificador": identificador,
+            "empresa_id": empresa_id,
+            "registros": len(df_tratado),
+            "silver": f"s3://{bucket_silver}/{chave_s3_silver}",
+            "gold": f"s3://{bucket_gold}/{chave_s3_gold}",
+        })
+        print(f"  [LAMBDA OK] {identificador} ({empresa_nome}): {len(df_tratado)} registros processados.")
+
+    return {
+        "chave": chave_s3,
+        "status": "processado",
+        "maquinas": maquinas_processadas,
+    }
+
+
+def lambda_handler(event, context):
+    """
+    Handler AWS Lambda (Python 3.12) acionado por eventos S3 (ObjectCreated) no Bucket Bronze.
+    """
+    bucket_silver = os.getenv("AWS_BUCKET_SILVER", AWS_BUCKET_SILVER).strip()
+    bucket_gold = os.getenv("AWS_BUCKET_GOLD", AWS_BUCKET_GOLD).strip()
+
+    if not bucket_silver or not bucket_gold:
+        raise ValueError("Configure as variáveis de ambiente AWS_BUCKET_SILVER e AWS_BUCKET_GOLD no Lambda.")
+    if bucket_silver == bucket_gold:
+        raise ValueError("AWS_BUCKET_SILVER e AWS_BUCKET_GOLD devem ser buckets distintos.")
+
+    s3 = obter_cliente_s3()
+    if s3 is None:
+        raise RuntimeError("Biblioteca boto3 não disponível no ambiente Lambda.")
+
+    registros = (event or {}).get("Records", [])
+    if not registros:
+        print("[LAMBDA] Evento sem Records S3 recebido.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"mensagem": "Nenhum registro S3 para processar.", "resultados": []}, ensure_ascii=False),
+        }
+
+    _limpar_dir_temporario()
+    resultados = []
+    chaves_processadas = set()
+
+    try:
+        mapa_bd = carregar_maquinas_bd()
+
+        for record in registros:
+            s3_info = record.get("s3", {})
+            bucket_bronze = s3_info.get("bucket", {}).get("name", "").strip()
+            chave_raw = s3_info.get("object", {}).get("key", "")
+            chave_s3 = unquote_plus(chave_raw)
+
+            if not bucket_bronze or not chave_s3:
+                resultados.append({"status": "ignorado", "motivo": "registro_incompleto"})
+                continue
+
+            if bucket_bronze in (bucket_silver, bucket_gold):
+                raise ValueError(
+                    f"Bucket de origem ({bucket_bronze}) não pode ser igual ao Silver ou Gold (evita loop infinito)."
+                )
+
+            # Evita processar a mesma máquina duas vezes caso sistema e processos cheguem no mesmo batch
+            chave_sistema, _, _ = _resolver_chaves_evento_bronze(chave_s3)
+            chave_dedup = (bucket_bronze, chave_sistema or chave_s3)
+            if chave_dedup in chaves_processadas:
+                resultados.append({"chave": chave_s3, "status": "ignorado", "motivo": "duplicado_no_lote"})
+                continue
+            chaves_processadas.add(chave_dedup)
+
+            res = processar_arquivo_bronze_s3(
+                s3=s3,
+                bucket_bronze=bucket_bronze,
+                chave_s3=chave_s3,
+                mapa_bd=mapa_bd,
+                bucket_silver=bucket_silver,
+                bucket_gold=bucket_gold,
+            )
+            resultados.append(res)
+    finally:
+        _limpar_dir_temporario()
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"resultados": resultados}, ensure_ascii=False),
+    }
+
+
+# EXECUÇÃO LOCAL (CLI)
 
 def main():
     if AWS_BAIXAR or AWS_UPLOAD:
