@@ -18,7 +18,7 @@ import uuid
 
 # Importação do dotenv para carregamento de configurações do arquivo .env
 try:
-    from dotenv import dotenv_values, load_dotenv
+    from dotenv import load_dotenv
 except ImportError as erro:
     print(f"\n{'=' * 100}\nErro ao carregar a biblioteca python-dotenv: {erro}\nInstale com: pip install python-dotenv\n{'=' * 100}")
     sys.exit(1)
@@ -51,29 +51,7 @@ def obter_regiao_instancia():
         return None
 
 
-
 # configuração
-
-
-INTERVALO_COLETA = 1       # segundos de espera entre ciclos
-INTERVALO_CPU = 1          # segundos de medição do uso de CPU (bloqueante)
-TOP_PROCESSOS = 50         # quantos processos gravar por ciclo (0 = todos)
-
-# Partições ignoradas no monitoramento
-FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"} # Partições não especificadas no arquivo de Capturas de Métricas e no Figma
-
-# Configurações AWS S3 (opcional) 
-AWS_ENVIAR = os.getenv("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
-AWS_BUCKET = os.getenv("AWS_BUCKET", "")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
-AWS_PREFIXO = "track-commerce/bronze"
-INTERVALO_UPLOAD_S = int(os.getenv("INTERVALO_UPLOAD_S", "300"))
-
-
-
 #diretório padrão da aplicação
 
 
@@ -90,10 +68,8 @@ os.chdir(DIR_APP)
 # Carrega as variáveis do arquivo .env localizado no diretório da aplicação
 caminho_env = os.path.join(DIR_APP, ".env")
 load_dotenv(dotenv_path=caminho_env)
-config = dotenv_values(caminho_env)
-
-TOKEN_INSTALACAO = config.get("TOKEN_INSTALACAO", "").strip()
-API_BASE_URL = config.get("API_BASE_URL", "http://localhost:3333").rstrip("/")
+TOKEN_INSTALACAO = os.getenv("TOKEN_INSTALACAO", "").strip()
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:3333").rstrip("/")
 
 DIR_BRONZE = os.path.join(DIR_APP, "track-commerce", "bronze")
 os.makedirs(DIR_BRONZE, exist_ok=True)
@@ -114,14 +90,25 @@ FS_IGNORADOS = {"", "squashfs", "iso9660", "udf", "overlay", "devtmpfs", "tmpfs"
 _regiao_detectada = obter_regiao_instancia()
 regiao_instancia = _regiao_detectada or "Desconhecida"
 
-AWS_ENVIAR = config.get("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
-AWS_BUCKET = config.get("AWS_BUCKET", "")
-AWS_REGION = config.get("AWS_REGION") or os.getenv("AWS_REGION") or _regiao_detectada or "us-east-1"
-AWS_ACCESS_KEY_ID = config.get("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = config.get("AWS_SECRET_ACCESS_KEY", "")
-AWS_SESSION_TOKEN = config.get("AWS_SESSION_TOKEN", "")
-AWS_PREFIXO = "track-commerce/bronze"
-INTERVALO_UPLOAD_S = int(config.get("INTERVALO_UPLOAD_S", "300"))
+AWS_ENVIAR = os.getenv("AWS_ENVIAR", "False").lower() in ("true", "1", "t", "yes")
+AWS_REGION = os.getenv("AWS_REGION") or _regiao_detectada or "us-east-1"
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
+INTERVALO_UPLOAD_S = int(os.getenv("INTERVALO_UPLOAD_S", "300"))
+AWS_BUCKET_BRONZE = os.getenv("AWS_BUCKET_BRONZE", "").strip()
+DECLARED_MONTHLY_COST = None
+_decl = os.getenv("DECLARED_MONTHLY_COST", "").strip()
+if _decl:
+    try:
+        DECLARED_MONTHLY_COST = float(_decl)
+    except Exception:
+        DECLARED_MONTHLY_COST = None
+
+# Configurações Globalping (1 requisição por janela de 15 minutos)
+GLOBALPING_TARGET = os.getenv("GLOBALPING_TARGET", "").strip()
+GLOBALPING_REGIAO = os.getenv("GLOBALPING_REGIAO", "BR").strip()
+INTERVALO_GLOBALPING_S = int(os.getenv("INTERVALO_GLOBALPING_S", "900"))
 
 
 # ==========================================================================================
@@ -238,6 +225,11 @@ HEADER_SISTEMA = [
     # Identificação
     "identifier", "enterprise_identifier", "enterprise_reason", "vm_nome",
     "timestamp", "hostname", "os", "platform", "region", "boot_time",
+    # Hardware normalizado / EC2 metadata
+    "vcpus", "ram_gb", "disk_gb",
+    "ec2_instance_id", "ec2_instance_type", "ec2_availability_zone", "ec2_region",
+    "ec2_tenancy", "ec2_license_model", "hardware_payload_source",
+    "declared_monthly_cost",
 
     # CPU
     "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
@@ -273,7 +265,11 @@ HEADER_SISTEMA = [
     "network_recv_mb_min", "network_sent_mb_min",
 
     # Conexões ativas agregadas por estado
-    "net_conn_total", "net_established", "net_time_wait","net_close_wait", "net_none", "net_outros",
+    "net_conn_total", "net_established", "net_time_wait", "net_close_wait", "net_none", "net_outros",
+
+    # Rota Externa (Globalping - 15m)
+    "ec2_public_ip", "globalping_regiao", "globalping_target",
+    "globalping_latencia_ms", "globalping_perda_pct", "globalping_perda_pacotes",
 ]
 
 HEADER_PARTICOES = [
@@ -329,7 +325,7 @@ def obter_cliente_s3():
         print("[AVISO] AWS_ENVIAR=True, mas boto3 não está instalado. Envio ao S3 desativado.")
         _s3_desativado = True
         return None
-    if not (AWS_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+    if not (AWS_BUCKET_BRONZE and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
         print("[AVISO] Bucket ou credenciais AWS ausentes no arquivo .env. Envio ao S3 desativado.")
         _s3_desativado = True
         return None
@@ -348,16 +344,20 @@ def obter_cliente_s3():
 
 
 def enviar_arquivos_s3(caminhos):
+    empresa = str(registro_agente.get("id_empresa") or "")
+    if not empresa.isdecimal():
+        print("[AVISO] ID de empresa inválido; CSVs mantidos apenas localmente.")
+        return
     cliente = obter_cliente_s3()
     if cliente is None:
         return
     for caminho in caminhos:
         if not os.path.isfile(caminho):
             continue
-        chave = f"{AWS_PREFIXO}/{os.path.basename(caminho)}"
+        chave = f"{empresa}/{os.path.basename(caminho)}"
         try:
-            cliente.upload_file(caminho, AWS_BUCKET, chave)
-            print(f"[S3] Enviado: s3://{AWS_BUCKET}/{chave}")
+            cliente.upload_file(caminho, AWS_BUCKET_BRONZE, chave)
+            print(f"[S3] Enviado: s3://{AWS_BUCKET_BRONZE}/{chave}")
         except Exception as erro:
             print(f"[AVISO] Falha ao enviar {caminho} ao S3: {erro}")
 
@@ -438,7 +438,7 @@ def contar_conexoes_resumo():
     vazio = {"total": None, "established": None, "time_wait": None,
              "close_wait": None, "none": None, "outros": None}
     try:
-        conexoes = psutil.net_connections(kind="inet")
+        conexoes = psutil.net_connections(kind="tcp")
     except (psutil.AccessDenied, OSError, NotImplementedError):
         return vazio
     estados = {}
@@ -451,8 +451,130 @@ def contar_conexoes_resumo():
     return {"total": total, **principais, "outros": total - sum(principais.values())}
 
 
-
 ultima_amostra_rede = None
+
+
+def obter_metadados_ec2(timeout=0.3):
+    """
+    Tenta obter metadados EC2 via IMDSv2/v1. Retorna dicionário com chaves:
+    ec2_instance_id, ec2_instance_type, ec2_availability_zone, ec2_region, ec2_tenancy, _ec2_metadata_ok
+    """
+    base = "http://169.254.169.254/latest"
+    headers = {}
+    try:
+        # IMDSv2 token
+        req = urllib.request.Request(base + "/api/token", method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            token = r.read().decode("utf-8")
+            if token:
+                headers["X-aws-ec2-metadata-token"] = token
+    except Exception:
+        # token failure -> try IMDSv1 fallback
+        headers = {}
+
+    def _md(path):
+        try:
+            req = urllib.request.Request(base + path, headers=headers or None)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8")
+        except Exception:
+            return None
+
+    inst_id = _md("/meta-data/instance-id")
+    inst_type = _md("/meta-data/instance-type")
+    az = _md("/meta-data/placement/availability-zone")
+    tenancy = _md("/meta-data/placement/tenancy") or None
+    public_ip = _md("/meta-data/public-ipv4")
+    doc = _md("/dynamic/instance-identity/document")
+    platform_meta = _md("/meta-data/platform")
+    region = None
+    if doc:
+        try:
+            j = json.loads(doc)
+            region = j.get("region")
+        except Exception:
+            region = None
+
+    return {
+        "ec2_instance_id": inst_id,
+        "ec2_instance_type": inst_type,
+        "ec2_availability_zone": az,
+        "ec2_region": region,
+        "ec2_tenancy": tenancy,
+        "platform": platform_meta,
+        "ec2_public_ip": public_ip,
+        "_ec2_metadata_ok": bool(inst_id or inst_type)
+    }
+
+
+_ultimo_globalping_ts = None
+_ultimo_globalping_dado = None
+
+
+def consultar_globalping_unico(target_host, regiao="BR"):
+    """Faz 1 única medição de ping na API Globalping e retorna um resultado consolidado."""
+    if not target_host:
+        return None
+    try:
+        payload = json.dumps({
+            "type": "ping",
+            "target": target_host,
+            "measurementOptions": {"packets": 16},
+            "locations": [{"country": regiao, "limit": 1}],
+        }).encode("utf-8")
+        req_create = urllib.request.Request(
+            "https://api.globalping.io/v1/measurements",
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "TrackCommerce-Captura/1.0"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_create, timeout=10) as resp:
+            criado = json.loads(resp.read().decode("utf-8"))
+        measurement_id = criado.get("id")
+        if not measurement_id:
+            return None
+
+        for _ in range(8):
+            time.sleep(0.6)
+            req_poll = urllib.request.Request(
+                f"https://api.globalping.io/v1/measurements/{measurement_id}",
+                headers={"User-Agent": "TrackCommerce-Captura/1.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req_poll, timeout=10) as resp_poll:
+                medicao = json.loads(resp_poll.read().decode("utf-8"))
+            if medicao.get("status") == "finished" and medicao.get("results"):
+                stats_list = [r.get("result", {}).get("stats") for r in medicao["results"] if r.get("result", {}).get("stats")]
+                if not stats_list:
+                    return None
+                latencia = round(sum(float(s.get("avg") or 0) for s in stats_list) / len(stats_list), 2)
+                perda_pct = round(sum(float(s.get("loss") or 0) for s in stats_list) / len(stats_list), 2)
+                perda_pacotes = int(sum(int(s.get("drop") or 0) for s in stats_list))
+                return {
+                    "regiao": regiao,
+                    "target": target_host,
+                    "latencia_ms": latencia,
+                    "perda_pct": perda_pct,
+                    "perda_pacotes": perda_pacotes,
+                }
+    except Exception as erro:
+        print(f"[AVISO Globalping] Falha ao consultar rota externa ({target_host}): {erro}")
+    return None
+
+
+def obter_globalping_15m(target_host, regiao="BR"):
+    """Garante no máximo 1 requisição ao Globalping por janela de 15 minutos."""
+    global _ultimo_globalping_ts, _ultimo_globalping_dado
+    if not target_host:
+        return None
+    agora = time.monotonic()
+    if _ultimo_globalping_ts is None or (agora - _ultimo_globalping_ts) >= INTERVALO_GLOBALPING_S:
+        resultado = consultar_globalping_unico(target_host, regiao)
+        _ultimo_globalping_ts = agora
+        if resultado is not None:
+            _ultimo_globalping_dado = resultado
+        return resultado
+    return _ultimo_globalping_dado
 
 
 def coletar_ciclo():
@@ -532,6 +654,23 @@ def coletar_ciclo():
     conexoes_detalhadas = coletar_conexoes_detalhadas(timestamp)
     processos = coletar_processos(timestamp)
     particoes = coletar_particoes(timestamp)
+    # hardware normalizado e detecção EC2
+    try:
+        vcpus = int(psutil.cpu_count(logical=True) or 1)
+    except Exception:
+        vcpus = None
+    try:
+        ram_gb = round(memoria.total / (1024 ** 3), 2) if memoria and getattr(memoria, "total", None) else None
+    except Exception:
+        ram_gb = None
+    try:
+        disk_gb = round(d_root_total / (1024 ** 3), 2) if d_root_total is not None else None
+    except Exception:
+        disk_gb = None
+    md = obter_metadados_ec2()
+    ec2_ok = md.get("_ec2_metadata_ok", False)
+    target_globalping = GLOBALPING_TARGET or md.get("ec2_public_ip")
+    gp = obter_globalping_15m(target_globalping, GLOBALPING_REGIAO) or {}
 
     dados = {
         "identifier": mach_uuid,
@@ -544,6 +683,25 @@ def coletar_ciclo():
         "platform": platform.platform(),
         "region": regiao_instancia,
         "boot_time": psutil.boot_time(),
+        # normalized hardware & EC2 metadata (may be None)
+        "vcpus": vcpus,
+        "ram_gb": ram_gb,
+        "disk_gb": disk_gb,
+        "ec2_instance_id": md.get("ec2_instance_id"),
+        "ec2_instance_type": md.get("ec2_instance_type"),
+        "ec2_availability_zone": md.get("ec2_availability_zone"),
+        "ec2_region": md.get("ec2_region"),
+        "ec2_tenancy": md.get("ec2_tenancy"),
+        "ec2_license_model": None,
+        # operacional system and preinstalled software hints for Pricing API
+        "ec2_operating_system": (
+            "Windows" if platform.system().lower().startswith("win") else
+            ("Linux" if platform.system().lower().startswith("linux") else platform.system())
+        ),
+        "ec2_preinstalled_sw": None,
+        "hardware_payload_source": "imds" if ec2_ok else "local_psutil",
+        # optional declared monthly cost provided via environment variable (float) or None
+        "declared_monthly_cost": DECLARED_MONTHLY_COST,
 
         # CPU
         "cpu_percent": cpu_percent,
@@ -627,6 +785,14 @@ def coletar_ciclo():
         "net_close_wait": conexoes_resumo["close_wait"],
         "net_none": conexoes_resumo["none"],
         "net_outros": conexoes_resumo["outros"],
+
+        # Rota Externa (Globalping - 15m)
+        "ec2_public_ip": md.get("ec2_public_ip"),
+        "globalping_regiao": gp.get("regiao") if gp else (GLOBALPING_REGIAO if target_globalping else None),
+        "globalping_target": gp.get("target") if gp else target_globalping,
+        "globalping_latencia_ms": gp.get("latencia_ms"),
+        "globalping_perda_pct": gp.get("perda_pct"),
+        "globalping_perda_pacotes": gp.get("perda_pacotes"),
     }
 
     gravar_csv(
