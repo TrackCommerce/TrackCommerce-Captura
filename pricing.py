@@ -138,8 +138,12 @@ def parametric_estimate(instance_type: str = None, vcpus: int | None = None, ram
     return round(hourly, 6)
 
 
-def get_rate_from_db(identifier: str, target_date: date):
-    """Consulta o banco para obter o valor vigente por 'Established' para a instância."""
+def _normalizar_identificador(valor: str | None) -> str:
+    return (valor or "").replace("-", "").replace("_", "").strip().lower()
+
+
+def _conectar_bd():
+    """Abre conexão com o MySQL quando configurado e disponível; caso contrário retorna None."""
     db_host = os.getenv("DB_HOST")
     db_user = os.getenv("DB_USER")
     # aceitar nomes alternativos para compatibilidade com o frontend/backend
@@ -147,42 +151,81 @@ def get_rate_from_db(identifier: str, target_date: date):
     db_name = os.getenv("DB_NAME") or os.getenv("DB_DATABASE")
     if not (db_host and db_user and db_pass and db_name):
         return None
+    if mysql_connector is None:
+        return None
     try:
-        if mysql_connector is None:
-            return None
-        conn = mysql_connector.connect(host=db_host, user=db_user, password=db_pass, database=db_name)
+        return mysql_connector.connect(host=db_host, user=db_user, password=db_pass, database=db_name)
     except Exception:
+        return None
+
+
+def carregar_instancias_bd() -> dict | None:
+    """Carrega do BD o status (ativo) e valor_por_established de todas as instâncias cadastradas."""
+    conn = _conectar_bd()
+    if conn is None:
         return None
     try:
         cursor = conn.cursor()
-        # tentar match exato pelo identificador
-        cursor.execute("SELECT id_instancia FROM instancia WHERE identificador = %s LIMIT 1", (identifier,))
+        cursor.execute("SELECT id_instancia, identificador, valor_por_established, ativo FROM instancia")
+        mapa = {"por_exato": {}, "por_normalizado": {}}
+        for row in cursor.fetchall():
+            inst_id, ident, valor_est, ativo = row[0], row[1], row[2], row[3]
+            if not ident:
+                continue
+            rate = None
+            if valor_est is not None:
+                try:
+                    rate = float(valor_est)
+                except Exception:
+                    rate = None
+            registro = {
+                "id_instancia": inst_id,
+                "identificador": ident,
+                "valor_por_established": rate,
+                "ativo": bool(ativo),
+            }
+            mapa["por_exato"][ident] = registro
+            norm = _normalizar_identificador(ident)
+            if norm:
+                mapa["por_normalizado"][norm] = registro
+        return mapa
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _buscar_instancia_no_mapa(mapa: dict, identifier: str) -> dict | None:
+    if identifier in mapa["por_exato"]:
+        return mapa["por_exato"][identifier]
+    return mapa["por_normalizado"].get(_normalizar_identificador(identifier))
+
+
+def get_rate_from_db(identifier: str, target_date: date):
+    """Consulta o banco para obter o valor vigente por 'Established' de instância ativa."""
+    conn = _conectar_bd()
+    if conn is None:
+        return None
+    try:
+        cursor = conn.cursor()
+        # tentar match exato pelo identificador apenas para instâncias ativas
+        cursor.execute(
+            "SELECT valor_por_established FROM instancia WHERE identificador = %s AND ativo = 1 LIMIT 1",
+            (identifier,),
+        )
         row = cursor.fetchone()
         if not row:
-            # tentar normalizado (remover - e _)
-            norm = identifier.replace("-", "").replace("_", "").lower()
-            cursor.execute("SELECT id_instancia, identificador FROM instancia")
-            rows = cursor.fetchall()
-            found = None
-            for r in rows:
-                iid = str(r[0])
-                ident = r[1] if len(r) > 1 else ""
-                if ident and ident.replace("-", "").replace("_", "").lower() == norm:
-                    found = r[0]
+            # tentar normalizado (remover - e _) entre instâncias ativas
+            norm = _normalizar_identificador(identifier)
+            cursor.execute("SELECT identificador, valor_por_established FROM instancia WHERE ativo = 1")
+            for ident, valor_est in cursor.fetchall():
+                if ident and _normalizar_identificador(ident) == norm:
+                    row = (valor_est,)
                     break
-            if found:
-                inst_id = found
-            else:
-                return None
-        else:
-            inst_id = row[0]
-
-        # Ler valor_por_established direto na tabela instancia (coluna adicionada no schema)
-        cursor.execute("SELECT valor_por_established FROM instancia WHERE id_instancia = %s LIMIT 1", (inst_id,))
-        rr = cursor.fetchone()
-        if rr and rr[0] is not None:
+        if row and row[0] is not None:
             try:
-                return float(rr[0])
+                return float(row[0])
             except Exception:
                 return None
         return None
@@ -344,6 +387,7 @@ def main(report_date: date | None = None):
     if not DIR_SILVER.exists():
         print("Pasta silver não encontrada. Abortando.")
         return
+    instancias_bd = carregar_instancias_bd()
     for pasta in sorted(DIR_SILVER.iterdir()):
         if not pasta.is_dir():
             continue
@@ -353,6 +397,15 @@ def main(report_date: date | None = None):
         for csvfile in sorted(pasta.glob("*_sistema.csv")):
             identifier = csvfile.stem.replace("_sistema","")
             try:
+                if instancias_bd is not None:
+                    inst_bd = _buscar_instancia_no_mapa(instancias_bd, identifier)
+                    if not inst_bd or not inst_bd["ativo"]:
+                        print(f"[INFO] Instância '{identifier}' inativa ou não cadastrada no BD; atualização de preço ignorada.")
+                        continue
+                    rate_used = inst_bd["valor_por_established"]
+                else:
+                    rate_used = None
+
                 info = analyze_silver_for_instance(csvfile, report_date)
                 if not info:
                     continue
@@ -361,8 +414,6 @@ def main(report_date: date | None = None):
                 region_code = info.get("ec2_region")
 
                 pricing_res = pricing_lookup(inst_type or "", region_code or "", cache)
-                # obter rate exclusivamente a partir do BD (instancia.valor_por_established)
-                rate_used = get_rate_from_db(identifier, report_date)
                 # se o BD estiver indisponível (rate_used is None), não aplicar fallback a fontes alternativas
                 critical_factor = DEFAULT_CRITICAL_FACTOR
                 costs = compute_costs_for_instance(info, pricing_res, rate_used, critical_factor)
