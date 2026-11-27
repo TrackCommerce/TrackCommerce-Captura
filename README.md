@@ -1,21 +1,22 @@
 # TrackCommerce-Captura — Deploy do ETL (`script-leitura.py`) na AWS Lambda
 
-Este guia descreve como implantar o `script-leitura.py` como uma função **AWS Lambda (Python 3.12)** acionada automaticamente sempre que o **Bucket S3 Bronze** receber um novo arquivo `.csv`.
+Este guia descreve como implantar o `script-leitura.py` como uma função **AWS Lambda (Python 3.12)** acionada automaticamente **uma única vez por ciclo** sempre que o **Bucket S3 Bronze** receber um arquivo `*_sistema.csv` (**Opção A**).
 
 ---
 
 ## Visão Geral do Fluxo
 
-1. Um novo arquivo `.csv` é enviado ao **Bucket Bronze** (`<empresa>/<identificador>_sistema.csv` ou `<empresa>/<identificador>_processos.csv`).
-2. O gatilho S3 (`s3:ObjectCreated:*`) dispara a função Lambda (`script-leitura.lambda_handler`).
-3. A função baixa o arquivo no diretório temporário `/tmp/track-commerce`, processa as métricas com `pandas` e grava:
-   - **Bucket Silver:** `<empresa>/<identificador>_sistema.csv`
-   - **Bucket Gold:**
-     - `<empresa>/<identificador>_sistema.json`
-     - `indice_maquinas_empresa_<empresa>.json` *(atualizado de forma incremental)*
-     - `indice_maquinas.json` *(atualizado de forma incremental)*
+1. O coletor (`script-escrita.py`) particiona os CSVs por dia (`YYYY-MM-DD`) e envia ao **Bucket Bronze** em `<id_empresa>/<identificador_canonico>/<YYYY-MM-DD>/`, subindo os arquivos auxiliares **primeiro** (`_particoes.csv`, `_processos.csv`, `_conexoes_rede.csv`) e **`_sistema.csv` por último**.
+2. O gatilho S3 (`s3:ObjectCreated:*`, **Suffix: `_sistema.csv`**) dispara a função Lambda (`script-leitura.lambda_handler`) **apenas 1 vez por ciclo**, eliminando as 4 invocações e a duplicidade de execução.
+3. A função baixa `_sistema.csv` + os auxiliares correspondentes (`_processos.csv` e `_particoes.csv`) em `/tmp/track-commerce`, valida a empresa/instância na API Express via HTTP (**Via 2**: `GET {API_BASE_URL}/agente/resolver-instancia/<identificador>`), processa as métricas com `pandas` e grava:
+   - **Bucket Silver:**
+     - `<id_empresa>/<identificador>/<YYYY-MM-DD>/<identificador>_sistema.csv`
+   - **Bucket Gold (estruturado e leve para as dashboards do Analista de Infraestrutura/TI):**
+     - `<id_empresa>/<identificador>/atual.json` *(snapshot instantâneo + Top 5 processos CPU/RAM + partições)*
+     - `<id_empresa>/<identificador>/dashboard.json` *(snapshot + janelas agregadas de 15m das últimas 24h de CPU, RAM, Disco e Rede + resumos)*
+     - `<id_empresa>/<identificador>/historico/<YYYY-MM-DD>.json` *(histórico detalhado restrito ao dia)*
 
-> Arquivos auxiliares `*_particoes.csv` e `*_conexoes_rede.csv` são ignorados automaticamente.
+> A escrita concorrente de `indice_maquinas.json` global foi removida da Lambda para eliminar *race conditions* entre múltiplas instâncias/empresas. A fonte de verdade da lista de instâncias é o MySQL (`instancia`), consultado pelo back-end Express.
 
 ---
 
@@ -24,7 +25,7 @@ Este guia descreve como implantar o `script-leitura.py` como uma função **AWS 
 - **3 Buckets S3 distintos** criados na mesma região (ex.: `us-east-1`):
   - Bucket **Bronze** (entrada de CSVs brutos)
   - Bucket **Silver** (saída de CSVs tratados)
-  - Bucket **Gold** (saída de JSONs consolidados e índices)
+  - Bucket **Gold** (saída de JSONs leves e histórico diário)
 - Conta AWS com permissão para criar/editar funções Lambda, Layers, Roles IAM e Triggers S3.
 
 > **Importante:** nunca configure o mesmo bucket como Bronze e Silver/Gold, pois isso causaria loop infinito de execuções. O código também bloqueia essa configuração.
@@ -33,21 +34,10 @@ Este guia descreve como implantar o `script-leitura.py` como uma função **AWS 
 
 ## Passo 1 — Empacotar o código (`.zip`)
 
-Na pasta `TrackCommerce-Captura`, gere um arquivo `.zip` contendo o `script-leitura.py` e o `eventos.json` (usado no cálculo de próximo pico):
+Com a **Via 2** (consulta à API Express via `urllib.request` nativo do Python), a Lambda **não precisa** de `mysql-connector-python`, `python-dotenv` nem configuração de VPC. Basta empacotar `script-leitura.py` e `eventos.json`:
 
 ```bash
 zip lambda-etl-leitura.zip script-leitura.py eventos.json
-```
-
-### (Opcional) Incluir suporte a banco de dados MySQL
-
-Por padrão, o Lambda usa os metadados de empresa presentes nos arquivos Bronze e **não precisa** do `mysql-connector-python` nem do `python-dotenv`. Caso queira consultar o MySQL a partir do Lambda, instale o conector na pasta do pacote antes de gerar o `.zip`:
-
-```bash
-mkdir -p pacote_lambda
-pip install mysql-connector-python -t pacote_lambda --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12
-cp script-leitura.py eventos.json pacote_lambda/
-cd pacote_lambda && zip -r ../lambda-etl-leitura.zip .
 ```
 
 ---
@@ -59,7 +49,7 @@ cd pacote_lambda && zip -r ../lambda-etl-leitura.zip .
    - **Function name:** `trackcommerce-etl-leitura` (ou nome de sua preferência)
    - **Runtime:** `Python 3.12`
    - **Architecture:** `x86_64`
-3. Em **Permissions**, escolha criar uma nova Role com permissões básicas do Lambda (ou selecione a Role do laboratório, como `LabRole` no AWS Academy, caso utilize ambiente acadêmico).
+3. Em **Permissions**, escolha criar uma nova Role com permissões básicas do Lambda (ou selecione `LabRole` no AWS Academy).
 4. Clique em **Create function**.
 
 ---
@@ -70,8 +60,6 @@ cd pacote_lambda && zip -r ../lambda-etl-leitura.zip .
 2. Na seção **Runtime settings**, clique em **Edit** e ajuste:
    - **Handler:** `script-leitura.lambda_handler`
 3. Clique em **Save**.
-
-> Caso prefira colar o código diretamente no editor padrão `lambda_function.py` do console, mantenha o Handler como `lambda_function.lambda_handler` e garanta que `eventos.json` esteja na raiz da função.
 
 ---
 
@@ -94,12 +82,11 @@ Acesse **Configuration → Environment variables → Edit** e adicione:
 | --- | :---: | --- |
 | `AWS_BUCKET_SILVER` | Sim | Nome do Bucket S3 Silver (ex.: `trackcommerce-silver`) |
 | `AWS_BUCKET_GOLD` | Sim | Nome do Bucket S3 Gold (ex.: `trackcommerce-gold`) |
+| `API_BASE_URL` | Recomendada | URL da API Express para separação autoritativa via BD (**Via 2**, ex.: `https://api.seu-dominio.com`) |
+| `API_INTERNAL_KEY` | Recomendada | Chave secreta compartilhada com a API Express (mesmo valor de `API_INTERNAL_KEY` no `.env` do Node) |
 | `AWS_UPLOAD` | Não | Padrão `True` no Lambda (mantém envio ao S3 ativo) |
-| `DB_HOST` | Não | Host do MySQL (se omitido, usa metadados do Bronze) |
-| `DB_PORT` | Não | Porta do MySQL (padrão `3306`) |
-| `DB_USER` | Não | Usuário do MySQL |
-| `DB_PASS` | Não | Senha do MySQL (também aceita `DB_PASSWORD`) |
-| `DB_NAME` | Não | Nome do banco MySQL (também aceita `DB_DATABASE`) |
+| `API_TIMEOUT_S` | Não | Timeout em segundos da consulta HTTP à API (padrão `5`) |
+| `API_CACHE_TTL_S` | Não | Cache em memória da instância resolvida em containers warm (padrão `300`) |
 
 > **Não** é necessário definir `AWS_ACCESS_KEY_ID` ou `AWS_SECRET_ACCESS_KEY` no Lambda: o código utiliza automaticamente as credenciais da **IAM Execution Role**.
 
@@ -107,7 +94,7 @@ Acesse **Configuration → Environment variables → Edit** e adicione:
 
 ## Passo 6 — Configurar Permissões IAM da Execution Role
 
-Acesse **Configuration → Permissions**, clique no nome da **Execution role** e garanta que ela possua permissão de logs no CloudWatch e acesso aos 3 buckets S3 (substitua pelos nomes reais dos seus buckets):
+Garanta que a **Execution role** possua permissão de logs no CloudWatch e acesso aos 3 buckets S3:
 
 ```json
 {
@@ -134,23 +121,16 @@ Acesse **Configuration → Permissions**, clique no nome da **Execution role** e
       "Resource": "arn:aws:s3:::SEU-BUCKET-SILVER/*"
     },
     {
-      "Sid": "LerEscreverBucketGold",
+      "Sid": "EscreverBucketGold",
       "Effect": "Allow",
       "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:ListBucket"
+        "s3:PutObject"
       ],
-      "Resource": [
-        "arn:aws:s3:::SEU-BUCKET-GOLD",
-        "arn:aws:s3:::SEU-BUCKET-GOLD/*"
-      ]
+      "Resource": "arn:aws:s3:::SEU-BUCKET-GOLD/*"
     }
   ]
 }
 ```
-
-> `s3:GetObject` no Bucket Gold é necessário para a atualização incremental dos índices (`indice_maquinas_empresa_<empresa>.json` e `indice_maquinas.json`).
 
 ---
 
@@ -158,21 +138,21 @@ Acesse **Configuration → Permissions**, clique no nome da **Execution role** e
 
 Acesse **Configuration → General configuration → Edit**:
 
-- **Memory:** `512 MB` (ou `1024 MB` se os CSVs Bronze tiverem grande volume de linhas)
+- **Memory:** `512 MB` (ou `1024 MB` para instâncias com alto volume diário)
 - **Timeout:** `1 min 0 sec` (60 segundos)
-- **Ephemeral storage (`/tmp`):** `512 MB` (padrão, suficiente pois o código limpa `/tmp/track-commerce` a cada execução)
+- **Ephemeral storage (`/tmp`):** `512 MB` (o código limpa `/tmp/track-commerce` a cada execução)
 
 ---
 
-## Passo 8 — Configurar o Gatilho (Trigger) do Bucket Bronze
+## Passo 8 — Configurar o Gatilho (Trigger) do Bucket Bronze (Opção A)
 
 1. Na tela da função Lambda, clique em **Add trigger**.
 2. Selecione **S3**.
 3. Configure:
    - **Bucket:** selecione o seu **Bucket Bronze**
    - **Event types:** `All object create events` (`s3:ObjectCreated:*`)
-   - **Prefix:** *(deixe vazio para monitorar todas as pastas de empresas)*
-   - **Suffix:** `.csv`
+   - **Prefix:** *(deixe vazio para monitorar todas as empresas e instâncias)*
+   - **Suffix:** **`_sistema.csv`** *(essencial para disparar apenas 1 vez por ciclo e evitar duplicidade!)*
 4. Marque a caixa de confirmação sobre invocação recursiva (garantindo que os buckets de saída Silver e Gold são diferentes do Bronze).
 5. Clique em **Add**.
 
@@ -180,6 +160,8 @@ Acesse **Configuration → General configuration → Edit**:
 
 ## Passo 9 — Testar e Monitorar
 
-1. Faça upload manual de um arquivo `<empresa>/<identificador>_sistema.csv` no **Bucket Bronze**.
-2. Na função Lambda, acesse **Monitor → View CloudWatch logs** para acompanhar a execução (`[S3 DOWNLOAD]`, `[S3 UPLOAD]`, `[LAMBDA OK]`).
-3. Verifique no **Bucket Silver** o arquivo `<empresa>/<identificador>_sistema.csv` e no **Bucket Gold** os arquivos `<empresa>/<identificador>_sistema.json`, `indice_maquinas_empresa_<empresa>.json` e `indice_maquinas.json`.
+1. Envie um lote de teste ao **Bucket Bronze** em `<id_empresa>/<identificador>/<YYYY-MM-DD>/` subindo `_particoes.csv`, `_processos.csv` e por último `_sistema.csv`.
+2. No CloudWatch Logs da Lambda, confirme que ocorreu **apenas 1 execução** com `[S3 DOWNLOAD]`, `[S3 UPLOAD]` e `[LAMBDA OK]`.
+3. Verifique:
+   - **Bucket Silver:** `<id_empresa>/<identificador>/<YYYY-MM-DD>/<identificador>_sistema.csv`
+   - **Bucket Gold:** `<id_empresa>/<identificador>/atual.json`, `dashboard.json` e `historico/<YYYY-MM-DD>.json`.

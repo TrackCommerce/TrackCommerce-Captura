@@ -131,12 +131,101 @@ print(f"Sistema: {platform.system()}")
 print(f"Região: {regiao_instancia}")
 
 
-# UUID - identificador da máquina
+# UUID - identificador estável da máquina e metadados EC2
+
+_cache_metadados_ec2 = None
+_ts_metadados_ec2 = None
+INTERVALO_CACHE_IMDS_S = 900
+
+
+def normalizar_identificador(valor):
+    """Normaliza o identificador para nome canônico de pasta/arquivo (minúsculo, sem '-' ou '_')."""
+    if not valor:
+        return ""
+    return str(valor).strip().lower().replace("-", "").replace("_", "")
+
+
+def obter_metadados_ec2(timeout=0.3, forcar=False):
+    """
+    Tenta obter metadados EC2 via IMDSv2/v1 (com cache em memória). Retorna dicionário com:
+    ec2_instance_id, ec2_instance_type, ec2_availability_zone, ec2_region, ec2_tenancy,
+    ec2_public_ip, _ec2_metadata_ok.
+    """
+    global _cache_metadados_ec2, _ts_metadados_ec2
+    agora = time.monotonic()
+    if (
+        not forcar
+        and _cache_metadados_ec2 is not None
+        and _ts_metadados_ec2 is not None
+        and (agora - _ts_metadados_ec2) < INTERVALO_CACHE_IMDS_S
+    ):
+        return _cache_metadados_ec2
+
+    base = "http://169.254.169.254/latest"
+    headers = {}
+    try:
+        # IMDSv2 token
+        req = urllib.request.Request(
+            base + "/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            token = r.read().decode("utf-8")
+            if token:
+                headers["X-aws-ec2-metadata-token"] = token
+    except Exception:
+        # token failure -> try IMDSv1 fallback
+        headers = {}
+
+    def _md(path):
+        try:
+            req = urllib.request.Request(base + path, headers=headers or None)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8")
+        except Exception:
+            return None
+
+    inst_id = _md("/meta-data/instance-id")
+    inst_type = _md("/meta-data/instance-type") if inst_id else None
+    az = _md("/meta-data/placement/availability-zone") if inst_id else None
+    tenancy = (_md("/meta-data/placement/tenancy") or None) if inst_id else None
+    public_ip = _md("/meta-data/public-ipv4") if inst_id else None
+    doc = _md("/dynamic/instance-identity/document") if inst_id else None
+    platform_meta = _md("/meta-data/platform") if inst_id else None
+    region = None
+    if doc:
+        try:
+            j = json.loads(doc)
+            region = j.get("region")
+        except Exception:
+            region = None
+
+    _cache_metadados_ec2 = {
+        "ec2_instance_id": inst_id,
+        "ec2_instance_type": inst_type,
+        "ec2_availability_zone": az,
+        "ec2_region": region,
+        "ec2_tenancy": tenancy,
+        "platform": platform_meta,
+        "ec2_public_ip": public_ip,
+        "_ec2_metadata_ok": bool(inst_id or inst_type),
+    }
+    _ts_metadados_ec2 = agora
+    return _cache_metadados_ec2
 
 
 def get_machineUUID():
-    """Devolve um identificador estável da máquina"""
+    """
+    Devolve um identificador estável e único da máquina.
+    Em instâncias EC2, prioriza o ec2_instance_id para evitar colisão em VMs clonadas da mesma AMI.
+    """
     try:
+        md_inicial = obter_metadados_ec2()
+        ec2_id = (md_inicial.get("ec2_instance_id") or "").strip()
+        if ec2_id:
+            return ec2_id
+
         if sys.platform == "win32":
             try:
                 txt = subprocess.check_output("wmic csproduct get uuid", shell=True,
@@ -201,8 +290,8 @@ def ativar_agente(identificador):
 
 
 mach_uuid = get_machineUUID()
-identificador_servidor = str(mach_uuid).replace("-", "_")
-print(f"UUID da Máquina: {mach_uuid}")
+identificador_canonico = normalizar_identificador(mach_uuid)
+print(f"Identificador da Máquina: {mach_uuid} (canônico: {identificador_canonico})")
 
 
 #Para testar localmente:
@@ -228,8 +317,8 @@ HEADER_SISTEMA = [
     # Hardware normalizado / EC2 metadata
     "vcpus", "ram_gb", "disk_gb",
     "ec2_instance_id", "ec2_instance_type", "ec2_availability_zone", "ec2_region",
-    "ec2_tenancy", "ec2_license_model", "hardware_payload_source",
-    "declared_monthly_cost",
+    "ec2_tenancy", "ec2_license_model", "ec2_operating_system", "ec2_preinstalled_sw",
+    "hardware_payload_source", "declared_monthly_cost",
 
     # CPU
     "cpu_percent", "cpu_por_nucleo", "cpu_freq_current", "cpu_freq_min", "cpu_freq_max",
@@ -288,10 +377,21 @@ HEADER_CONEXOES_REDE = [
     "local_ip", "local_port", "remote_ip", "remote_port", "status"
 ]
 
-arquivo_sistema = os.path.join(DIR_BRONZE, f"{identificador_servidor}_sistema.csv")
-arquivo_particoes = os.path.join(DIR_BRONZE, f"{identificador_servidor}_particoes.csv")
-arquivo_processos = os.path.join(DIR_BRONZE, f"{identificador_servidor}_processos.csv")
-arquivo_conexoes_rede = os.path.join(DIR_BRONZE, f"{identificador_servidor}_conexoes_rede.csv")
+
+def obter_caminhos_dia(data_ref=None):
+    """
+    Retorna a data de referência (YYYY-MM-DD) e os caminhos particionados por dia.
+    Evita crescimento infinito dos CSVs e mantém a ordem de envio (auxiliares antes de sistema).
+    """
+    data_str = data_ref or datetime.datetime.now().strftime("%Y-%m-%d")
+    pasta_dia = os.path.join(DIR_BRONZE, data_str)
+    os.makedirs(pasta_dia, exist_ok=True)
+    return data_str, {
+        "particoes": os.path.join(pasta_dia, f"{identificador_canonico}_particoes.csv"),
+        "processos": os.path.join(pasta_dia, f"{identificador_canonico}_processos.csv"),
+        "conexoes_rede": os.path.join(pasta_dia, f"{identificador_canonico}_conexoes_rede.csv"),
+        "sistema": os.path.join(pasta_dia, f"{identificador_canonico}_sistema.csv"),
+    }
 
 
 def gravar_csv(caminho, cabecalho, linhas):
@@ -343,7 +443,12 @@ def obter_cliente_s3():
     return _cliente_s3
 
 
-def enviar_arquivos_s3(caminhos):
+def enviar_arquivos_s3(data_ref=None):
+    """
+    Envia os CSVs do dia ao S3 Bronze em <empresa>/<id_canonico>/<YYYY-MM-DD>/<arquivo>.csv.
+    Opção A: envia os arquivos auxiliares primeiro e _sistema.csv por último para que o
+    gatilho da Lambda (Suffix=_sistema.csv) dispare apenas 1 vez já com todos os dados prontos.
+    """
     empresa = str(registro_agente.get("id_empresa") or "")
     if not empresa.isdecimal():
         print("[AVISO] ID de empresa inválido; CSVs mantidos apenas localmente.")
@@ -351,10 +456,18 @@ def enviar_arquivos_s3(caminhos):
     cliente = obter_cliente_s3()
     if cliente is None:
         return
-    for caminho in caminhos:
+
+    data_str, caminhos = obter_caminhos_dia(data_ref)
+    ordem_upload = [
+        caminhos["particoes"],
+        caminhos["processos"],
+        caminhos["conexoes_rede"],
+        caminhos["sistema"],
+    ]
+    for caminho in ordem_upload:
         if not os.path.isfile(caminho):
             continue
-        chave = f"{empresa}/{os.path.basename(caminho)}"
+        chave = f"{empresa}/{identificador_canonico}/{data_str}/{os.path.basename(caminho)}"
         try:
             cliente.upload_file(caminho, AWS_BUCKET_BRONZE, chave)
             print(f"[S3] Enviado: s3://{AWS_BUCKET_BRONZE}/{chave}")
@@ -452,60 +565,6 @@ def contar_conexoes_resumo():
 
 
 ultima_amostra_rede = None
-
-
-def obter_metadados_ec2(timeout=0.3):
-    """
-    Tenta obter metadados EC2 via IMDSv2/v1. Retorna dicionário com chaves:
-    ec2_instance_id, ec2_instance_type, ec2_availability_zone, ec2_region, ec2_tenancy, _ec2_metadata_ok
-    """
-    base = "http://169.254.169.254/latest"
-    headers = {}
-    try:
-        # IMDSv2 token
-        req = urllib.request.Request(base + "/api/token", method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            token = r.read().decode("utf-8")
-            if token:
-                headers["X-aws-ec2-metadata-token"] = token
-    except Exception:
-        # token failure -> try IMDSv1 fallback
-        headers = {}
-
-    def _md(path):
-        try:
-            req = urllib.request.Request(base + path, headers=headers or None)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read().decode("utf-8")
-        except Exception:
-            return None
-
-    inst_id = _md("/meta-data/instance-id")
-    inst_type = _md("/meta-data/instance-type")
-    az = _md("/meta-data/placement/availability-zone")
-    tenancy = _md("/meta-data/placement/tenancy") or None
-    public_ip = _md("/meta-data/public-ipv4")
-    doc = _md("/dynamic/instance-identity/document")
-    platform_meta = _md("/meta-data/platform")
-    region = None
-    if doc:
-        try:
-            j = json.loads(doc)
-            region = j.get("region")
-        except Exception:
-            region = None
-
-    return {
-        "ec2_instance_id": inst_id,
-        "ec2_instance_type": inst_type,
-        "ec2_availability_zone": az,
-        "ec2_region": region,
-        "ec2_tenancy": tenancy,
-        "platform": platform_meta,
-        "ec2_public_ip": public_ip,
-        "_ec2_metadata_ok": bool(inst_id or inst_type)
-    }
-
 
 _ultimo_globalping_ts = None
 _ultimo_globalping_dado = None
@@ -795,23 +854,15 @@ def coletar_ciclo():
         "globalping_perda_pacotes": gp.get("perda_pacotes"),
     }
 
-    gravar_csv(
-        arquivo_sistema,
-        HEADER_SISTEMA,
-        [[dados.get(c) for c in HEADER_SISTEMA]]
-    )
+    data_str, caminhos = obter_caminhos_dia(timestamp[:10])
+    gravar_csv(caminhos["particoes"], HEADER_PARTICOES, particoes)
+    gravar_csv(caminhos["processos"], HEADER_PROCESSOS, processos)
+    gravar_csv(caminhos["conexoes_rede"], HEADER_CONEXOES_REDE, conexoes_detalhadas)
+    gravar_csv(caminhos["sistema"], HEADER_SISTEMA, [[dados.get(c) for c in HEADER_SISTEMA]])
 
-    gravar_csv(arquivo_particoes, HEADER_PARTICOES, particoes)
-    gravar_csv(arquivo_processos, HEADER_PROCESSOS, processos)
-    gravar_csv(arquivo_conexoes_rede, HEADER_CONEXOES_REDE, conexoes_detalhadas)
-
-    print(
-        f"[{timestamp}] CPU={cpu_percent}% | RAM={memoria.percent:.1f}% | "
-        f"Disco Raiz={d_root_pct}% | "
-        f"Conexões={len(conexoes_detalhadas)} | "
-        f"Processos={len(processos)}"
-    )
-
+    print(f"[{timestamp}] CPU={cpu_percent}% | RAM={memoria.percent:.1f}% | "
+          f"Disco Raiz={d_root_pct}% | Conexões={len(conexoes_detalhadas)} | Processos={len(processos)}")
+    return data_str
 
 
 # início captura
@@ -828,6 +879,8 @@ Envio ao S3: {"ATIVADO" if AWS_ENVIAR else "desativado"}
 {'=' * 100}
 ''')
 
+dia_atual_coleta = datetime.datetime.now().strftime("%Y-%m-%d")
+
 try:
     for _ in psutil.process_iter(["cpu_percent"]):
         pass
@@ -836,19 +889,25 @@ try:
 
     while True:
         try:
-            coletar_ciclo()
+            novo_dia = coletar_ciclo()
+            # Na virada do dia, envia o fechamento do dia anterior antes de seguir no novo dia
+            if AWS_ENVIAR and novo_dia and novo_dia != dia_atual_coleta:
+                enviar_arquivos_s3(dia_atual_coleta)
+                ultimo_upload = time.monotonic()
+            if novo_dia:
+                dia_atual_coleta = novo_dia
         except Exception as erro:
             print(f"[AVISO] Falha no ciclo de coleta: {erro}")
 
         if AWS_ENVIAR and time.monotonic() - ultimo_upload >= INTERVALO_UPLOAD_S:
-            enviar_arquivos_s3([arquivo_sistema, arquivo_particoes, arquivo_processos, arquivo_conexoes_rede])
+            enviar_arquivos_s3(dia_atual_coleta)
             ultimo_upload = time.monotonic()
 
         time.sleep(INTERVALO_COLETA)
 
 except KeyboardInterrupt:
     if AWS_ENVIAR:
-        enviar_arquivos_s3([arquivo_sistema, arquivo_particoes, arquivo_processos, arquivo_conexoes_rede])
+        enviar_arquivos_s3(dia_atual_coleta)
     print(f"\nInterrompendo a captura...\n\n{'=' * 100}\n")
 
 except Exception as e:

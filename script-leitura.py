@@ -3,17 +3,21 @@
  TRACK COMMERCE - ETL DE MÉTRICAS (BRONZE -> SILVER / GOLD) - AWS LAMBDA (PYTHON 3.12)
 ==========================================================================================
 
- Entrada : Evento S3 (Bucket Bronze) no AWS Lambda ou ./track-commerce/bronze/*.csv (local)
+ Entrada : Evento S3 (Bucket Bronze, Suffix _sistema.csv) no AWS Lambda ou ./track-commerce/bronze/**/*.csv
  Saída   :
-   SILVER (Análise R - inclui empresa_id e empresa_nome em todas as linhas e caminhos)
-     <pasta_empresa>/<identificador>_sistema.csv
-   GOLD   (JSON estruturado com histórico completo)
-     <pasta_empresa>/<identificador>_sistema.json
-     indice_maquinas_empresa_<pasta_empresa>.json
-     indice_maquinas.json
+   SILVER (Análise R e Pricing - inclui empresa_id e empresa_nome em todas as linhas)
+     <pasta_empresa>/<identificador>/<YYYY-MM-DD>/<identificador>_sistema.csv
+   GOLD   (JSON estruturado e leve orientado ao Front-end do Analista)
+     <pasta_empresa>/<identificador>/atual.json
+     <pasta_empresa>/<identificador>/dashboard.json
+     <pasta_empresa>/<identificador>/historico/<YYYY-MM-DD>.json
+
+ Integração com BD (Via 2 - Recomendada na Lambda):
+   Consulta HTTP à API Express (GET {API_BASE_URL}/agente/resolver-instancia/<identificador>)
+   usando urllib nativo + header X-API-KEY (sem driver MySQL nem configuração de VPC).
 
  Usa pandas (Layer AWSSDKPandas-Python312 no Lambda) + boto3 (nativo no Lambda)
- + python-dotenv e mysql.connector (opcionais).
+ + python-dotenv e mysql.connector (opcionais apenas para uso local).
 ==========================================================================================
 """
 
@@ -22,9 +26,13 @@
 import glob
 import json
 import os
+import re
 import shutil
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
-from urllib.parse import unquote_plus
+from urllib.parse import quote, unquote_plus
 
 import pandas as pd
 
@@ -75,6 +83,13 @@ LIMITE_RAM_CRITICO = 85.0
 
 COLUNAS_OBRIGATORIAS = ["identifier", "timestamp"]
 
+# Integração Via 2 (Lambda -> API Express -> MySQL)
+API_BASE_URL = os.getenv("API_BASE_URL", "").strip().rstrip("/")
+API_INTERNAL_KEY = os.getenv("API_INTERNAL_KEY", "").strip()
+API_TIMEOUT_S = float(os.getenv("API_TIMEOUT_S", "5"))
+API_CACHE_TTL_S = int(os.getenv("API_CACHE_TTL_S", "300"))
+_cache_api_instancias = {}
+
 # S3 Download / Upload (no Lambda, upload vem habilitado por padrão)
 AWS_BAIXAR = os.getenv("AWS_BAIXAR", "False").lower() in ("true", "1", "t", "yes")
 AWS_UPLOAD = os.getenv("AWS_UPLOAD", "True" if EM_LAMBDA else "False").lower() in ("true", "1", "t", "yes")
@@ -94,7 +109,9 @@ METRICAS_DESVIO = [
     "rede_upload_bytes_s", "rede_download_bytes_s", "rede_perda_pacotes_pct",
 ]
 
-# AWS S3 E BANCO DE DADOS
+REGEX_DATA_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# AWS S3, API INTERNA (VIA 2) E BANCO DE DADOS
 
 _cliente_s3_cache = None
 
@@ -121,7 +138,7 @@ def obter_cliente_s3():
 
 
 def baixar_bronze_s3():
-    """Baixa automaticamente os CSVs do S3 para a pasta local bronze antes do processamento."""
+    """Baixa automaticamente os CSVs do S3 para a pasta local bronze preservando subpastas."""
     if not (AWS_BAIXAR and AWS_BUCKET_BRONZE):
         return
 
@@ -139,15 +156,11 @@ def baixar_bronze_s3():
                 key = obj["Key"]
                 if not key or not key.endswith(".csv"):
                     continue
-                # esperar formato <empresa>/<arquivo>.csv (empresa pode ser id ou nome)
-                if "/" in key:
-                    empresa_id, nome_arquivo = key.split("/", 1)
-                    pasta_destino = os.path.join(DIR_BRONZE, empresa_id)
-                    os.makedirs(pasta_destino, exist_ok=True)
-                    destino = os.path.join(pasta_destino, nome_arquivo)
-                else:
-                    nome_arquivo = os.path.basename(key)
-                    destino = os.path.join(DIR_BRONZE, nome_arquivo)
+                partes = [p for p in key.strip("/").split("/") if p and p not in (".", "..")]
+                if not partes:
+                    continue
+                destino = os.path.join(DIR_BRONZE, *partes)
+                os.makedirs(os.path.dirname(destino), exist_ok=True)
                 try:
                     s3.download_file(AWS_BUCKET_BRONZE, key, destino)
                     print(f"  [S3 DOWNLOAD] Baixado: {key} -> {destino}")
@@ -185,36 +198,103 @@ def enviar_para_s3(caminho_local, chave_s3, bucket, documento=None, propagar_err
             raise
 
 
-def ler_json_s3(s3, bucket, chave):
-    """Lê um JSON existente no S3; retorna None se não existir ou estiver inválido."""
+def consultar_instancia_api(identificador):
+    """
+    Via 2: consulta a API Express (GET /agente/resolver-instancia/<identificador>)
+    para obter empresa e nome autoritativos do MySQL sem driver MySQL nem VPC na Lambda.
+    """
+    base_url = os.getenv("API_BASE_URL", API_BASE_URL).strip().rstrip("/")
+    if not base_url or not identificador:
+        return None
+
+    chave = normalizar_identificador(identificador)
+    if not chave:
+        return None
+
+    agora = time.monotonic()
+    em_cache = _cache_api_instancias.get(chave)
+    if em_cache and (agora - em_cache["ts"]) < API_CACHE_TTL_S:
+        return em_cache["dados"]
+
+    api_key = os.getenv("API_INTERNAL_KEY", API_INTERNAL_KEY).strip()
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["X-API-KEY"] = api_key
+
+    url = f"{base_url}/agente/resolver-instancia/{quote(chave, safe='')}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        resp = s3.get_object(Bucket=bucket, Key=chave)
-        return json.loads(resp["Body"].read().decode("utf-8"))
-    except ClientError as erro:
-        codigo = erro.response.get("Error", {}).get("Code", "")
-        if codigo in ("NoSuchKey", "404", "NotFound"):
-            return None
-        print(f"  [AVISO S3 LEITURA] Falha ao ler s3://{bucket}/{chave}: {erro}")
-        return None
-    except Exception as erro:
-        print(f"  [AVISO S3 LEITURA] Conteúdo inválido em s3://{bucket}/{chave}: {erro}")
-        return None
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        dados = {
+            "id_instancia": payload.get("id_instancia"),
+            "empresa_id": para_texto(payload.get("id_empresa")),
+            "empresa_nome": para_texto(payload.get("empresa")),
+            "vm_nome": para_texto(payload.get("nome")),
+        }
+        if dados["empresa_id"]:
+            _cache_api_instancias[chave] = {"ts": agora, "dados": dados}
+            return dados
+    except urllib.error.HTTPError as erro:
+        print(f"  [AVISO API] Falha ao resolver instância '{chave}' (HTTP {erro.code}).")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as erro:
+        print(f"  [AVISO API] API indisponível ao resolver '{chave}': {erro}")
+    return None
+
+
+def resolver_metadados_empresa(identificador, df_bronze, mapa_bd=None, prefixo_empresa=None):
+    """
+    Resolve vínculo instância -> empresa em ordem de autoridade:
+      1. API Express (Via 2 -> MySQL autoritativo)
+      2. Mapa direto do MySQL (quando DB_HOST configurado em uso local)
+      3. Metadados do próprio CSV Bronze
+      4. Prefixo da empresa no caminho S3
+      5. Fallback padrão
+    """
+    info_api = consultar_instancia_api(identificador) or {}
+    info_bd = (mapa_bd or {}).get(identificador, {})
+
+    prefixo_valido = prefixo_empresa if (prefixo_empresa and str(prefixo_empresa).isdecimal()) else None
+
+    empresa_id = (
+        info_api.get("empresa_id")
+        or info_bd.get("empresa_id")
+        or ultimo_valido_bronze(df_bronze, "enterprise_identifier", "empresa_id")
+        or prefixo_valido
+        or "sem_empresa"
+    )
+    empresa_nome = (
+        info_api.get("empresa_nome")
+        or info_bd.get("empresa_nome")
+        or ultimo_valido_bronze(df_bronze, "enterprise_reason", "empresa_nome")
+        or "Empresa Desconhecida"
+    )
+    vm_nome = (
+        info_api.get("vm_nome")
+        or info_bd.get("vm_nome")
+        or ultimo_valido_bronze(df_bronze, "vm_nome", "hostname")
+    )
+    id_instancia = info_api.get("id_instancia") or info_bd.get("id_instancia")
+
+    return {
+        "id_instancia": id_instancia,
+        "empresa_id": empresa_id,
+        "empresa_nome": empresa_nome,
+        "vm_nome": vm_nome,
+    }
 
 
 def carregar_maquinas_bd():
-    """Busca no BD o vínculo máquina -> empresa. Se inacessível ou não configurado, retorna {}."""
+    """Busca opcional direta no MySQL (uso local/CLI quando DB_HOST estiver configurado)."""
     if mysql_connector is None:
-        print("[INFO BD] mysql-connector não instalado; utilizando metadados do Bronze.")
         return {}
 
     db_host = os.getenv("DB_HOST", "").strip()
     if not db_host:
-        print("[INFO BD] DB_HOST não configurado; utilizando metadados do Bronze.")
         return {}
 
     try:
         db_user = os.getenv("DB_USER")
-        # aceitar nomes alternativos usados em outros componentes
         db_pass = os.getenv("DB_PASS") or os.getenv("DB_PASSWORD")
         db_name = os.getenv("DB_NAME") or os.getenv("DB_DATABASE")
         db_port = int(os.getenv("DB_PORT", "3306"))
@@ -227,12 +307,12 @@ def carregar_maquinas_bd():
             connection_timeout=5,
         )
     except Exception as erro:
-        print(f"[AVISO BD] Indisponível, utilizando dados de empresa do Bronze: {erro}")
+        print(f"[AVISO BD] Indisponível, utilizando API/Bronze: {erro}")
         return {}
     try:
         cursor = conexao.cursor(dictionary=True)
         cursor.execute('''
-            SELECT i.identificador AS identifier, i.nome AS vm_name,
+            SELECT i.id_instancia, i.identificador AS identifier, i.nome AS vm_name,
                    e.id_empresa AS enterprise_identifier, e.razao_social AS social_reason
             FROM empresa AS e
             INNER JOIN instancia AS i ON i.fk_empresa = e.id_empresa;''')
@@ -240,9 +320,12 @@ def carregar_maquinas_bd():
         for r in cursor.fetchall():
             ident = normalizar_identificador(r["identifier"])
             if ident:
-                mapa[ident] = {"empresa_id": para_texto(r["enterprise_identifier"]),
-                               "empresa_nome": para_texto(r["social_reason"]),
-                               "vm_nome": para_texto(r["vm_name"])}
+                mapa[ident] = {
+                    "id_instancia": r.get("id_instancia"),
+                    "empresa_id": para_texto(r["enterprise_identifier"]),
+                    "empresa_nome": para_texto(r["social_reason"]),
+                    "vm_nome": para_texto(r["vm_name"]),
+                }
         return mapa
     finally:
         conexao.close()
@@ -366,12 +449,21 @@ def estatisticas_serie(serie):
 def ler_bronze(caminho):
     if not os.path.isfile(caminho) or os.path.getsize(caminho) == 0:
         return pd.DataFrame()
+    df = None
     try:
-        df = pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
+        # Engine C (rápido e baixo uso de RAM) para CSV padrão delimitado por ';'
+        df = pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip", low_memory=False)
+        df.columns = [c.strip() for c in df.columns]
     except Exception:
-        return pd.DataFrame()
+        df = None
 
-    df.columns = [c.strip() for c in df.columns]
+    if df is None or any(c not in df.columns for c in COLUNAS_OBRIGATORIAS):
+        try:
+            df = pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
+            df.columns = [c.strip() for c in df.columns]
+        except Exception:
+            return pd.DataFrame()
+
     if any(c not in df.columns for c in COLUNAS_OBRIGATORIAS):
         return pd.DataFrame()
 
@@ -514,12 +606,20 @@ def transformar_dataframe(df_bronze, empresa):
         "disco_livre_gb": (col_pos(df, "disk_root_free") / BYTES_POR_GB).round(3),
         "disco_leitura_bytes_s": taxa("disk_read_bytes"),
         "disco_escrita_bytes_s": taxa("disk_write_bytes"),
+        "disco_leitura_mb_s": (taxa("disk_read_bytes") / BYTES_POR_MB).round(2),
+        "disco_escrita_mb_s": (taxa("disk_write_bytes") / BYTES_POR_MB).round(2),
         "disco_iops_leitura": taxa("disk_read_count"),
         "disco_iops_escrita": taxa("disk_write_count"),
         "disco_iops_total": (d_io_total / intervalo).round(2),
         "disco_latencia_leitura_ms": (d_t_leitura / d_leituras.replace(0, float("nan"))).round(3),
         "disco_latencia_escrita_ms": (d_t_escrita / d_escritas.replace(0, float("nan"))).round(3),
         "disco_latencia_ms": (d_t_total / d_io_total.replace(0, float("nan"))).round(3),
+
+        # Hardware / Billing (preservados no Silver para pricing.py)
+        "vcpus": col_pos(df, "vcpus").fillna(nucleos_logicos),
+        "ram_gb": col_pos(df, "ram_gb").fillna((ram_total / BYTES_POR_GB).round(2)),
+        "disk_gb": col_pos(df, "disk_gb").fillna((col_pos(df, "disk_root_total") / BYTES_POR_GB).round(2)),
+        "declared_monthly_cost": col_pos(df, "declared_monthly_cost"),
 
         # REDE
         "rede_upload_bytes_s": rede_upload_bytes_s,
@@ -648,25 +748,35 @@ def contar_alertas_ram_24h(df):
     return {"total": atencao + critico, "atencao": atencao, "critico": critico}
 
 
-def processar_processos_ram(caminhos_csv):
+def processar_processos(caminhos_csv):
+    """
+    Processa os CSVs de processos gerando:
+      - cpu_top5: Top 5 processos por uso de CPU (Dashboards Geral e CPU do Analista)
+      - ram: maior_uso e maior_crescimento (Dashboard de RAM do Analista)
+    """
+    vazio = {"cpu_top5": [], "ram": {"maior_uso": [], "maior_crescimento": []}}
     dfs = []
     for caminho in caminhos_csv:
         if os.path.isfile(caminho) and os.path.getsize(caminho) > 0:
             try:
-                dfs.append(pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip"))
+                dfs.append(pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip", low_memory=False))
             except Exception:
                 continue
     if not dfs:
-        return {"maior_uso": [], "maior_crescimento": []}
+        return vazio
 
     df = pd.concat(dfs, ignore_index=True)
+    if "timestamp" not in df.columns or "pid" not in df.columns:
+        return vazio
+
     df["_ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df["memory_rss_mb"] = pd.to_numeric(df["memory_rss_mb"], errors="coerce")
-    df["memory_percent"] = pd.to_numeric(df["memory_percent"], errors="coerce").fillna(0.0)
-    df = df.dropna(subset=["pid", "_ts", "memory_rss_mb"]).sort_values("_ts")
+    df["memory_rss_mb"] = pd.to_numeric(df.get("memory_rss_mb"), errors="coerce").fillna(0.0)
+    df["memory_percent"] = pd.to_numeric(df.get("memory_percent"), errors="coerce").fillna(0.0)
+    df["cpu_percent"] = pd.to_numeric(df.get("cpu_percent"), errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["pid", "_ts"]).sort_values("_ts")
 
     if df.empty:
-        return {"maior_uso": [], "maior_crescimento": []}
+        return vazio
 
     ultimo_ts = df["_ts"].max()
     agrupado = df.groupby("pid").agg(
@@ -676,20 +786,86 @@ def processar_processos_ram(caminhos_csv):
         rss_ini=("memory_rss_mb", "first"),
         rss_fim=("memory_rss_mb", "last"),
         ram_percent=("memory_percent", "last"),
+        cpu_percent=("cpu_percent", "last"),
     ).reset_index()
 
     agrupado = agrupado[(ultimo_ts - agrupado["ts_fim"]).dt.total_seconds() <= 60]
+    if agrupado.empty:
+        return vazio
+
     horas = (agrupado["ts_fim"] - agrupado["ts_ini"]).dt.total_seconds() / 3600.0
     agrupado["tendencia_mb_h"] = ((agrupado["rss_fim"] - agrupado["rss_ini"]) / horas).where(horas > 0.001, 0.0).round(1)
     agrupado["ram_mb"] = agrupado["rss_fim"].round(1)
     agrupado["ram_percent"] = agrupado["ram_percent"].round(1)
+    agrupado["cpu_percent"] = agrupado["cpu_percent"].round(1)
     agrupado["pid"] = agrupado["pid"].astype(str)
 
-    cols = ["pid", "processo", "ram_mb", "ram_percent", "tendencia_mb_h"]
+    # Top 5 CPU (usado nas dashboards Geral e CPU)
+    top_cpu_df = agrupado.sort_values(by=["cpu_percent", "ram_percent"], ascending=[False, False]).head(5)
+    cpu_top5 = [
+        {
+            "pid": r["pid"],
+            "nome": para_texto(r["processo"]) or "desconhecido",
+            "cpu_percent": limpar_valor_json(r["cpu_percent"]),
+            "memory_percent": limpar_valor_json(r["ram_percent"]),
+            "ram_mb": limpar_valor_json(r["ram_mb"]),
+        }
+        for r in top_cpu_df.to_dict(orient="records")
+    ]
+
+    cols_ram = ["pid", "processo", "cpu_percent", "ram_mb", "ram_percent", "tendencia_mb_h"]
     return {
-        "maior_uso": agrupado.nlargest(5, "ram_mb")[cols].to_dict(orient="records"),
-        "maior_crescimento": agrupado.nlargest(5, "tendencia_mb_h")[cols].to_dict(orient="records"),
+        "cpu_top5": cpu_top5,
+        "ram": {
+            "maior_uso": agrupado.nlargest(5, "ram_mb")[cols_ram].to_dict(orient="records"),
+            "maior_crescimento": agrupado.nlargest(5, "tendencia_mb_h")[cols_ram].to_dict(orient="records"),
+        },
     }
+
+
+def processar_processos_ram(caminhos_csv):
+    """Alias retrocompatível que devolve apenas o bloco de processos de RAM."""
+    return processar_processos(caminhos_csv)["ram"]
+
+
+def processar_particoes(caminhos_csv):
+    """Lê o snapshot mais recente das partições em *_particoes.csv para a Dashboard de Disco."""
+    dfs = []
+    for caminho in caminhos_csv:
+        if os.path.isfile(caminho) and os.path.getsize(caminho) > 0:
+            try:
+                dfs.append(pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip", low_memory=False))
+            except Exception:
+                continue
+    if not dfs:
+        return []
+
+    df = pd.concat(dfs, ignore_index=True)
+    if "timestamp" not in df.columns or "mountpoint" not in df.columns:
+        return []
+
+    df["_ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["_ts", "mountpoint"]).sort_values("_ts")
+    if df.empty:
+        return []
+
+    ultimas = df.drop_duplicates(subset=["mountpoint"], keep="last")
+    resultado = []
+    for _, r in ultimas.iterrows():
+        total = pd.to_numeric(r.get("total"), errors="coerce")
+        usado = pd.to_numeric(r.get("used"), errors="coerce")
+        livre = pd.to_numeric(r.get("free"), errors="coerce")
+        pct = pd.to_numeric(r.get("percent"), errors="coerce")
+        resultado.append({
+            "device": para_texto(r.get("device")),
+            "mountpoint": para_texto(r.get("mountpoint")),
+            "fstype": para_texto(r.get("fstype")),
+            "total_gb": round(float(total) / BYTES_POR_GB, 2) if not pd.isna(total) else None,
+            "usado_gb": round(float(usado) / BYTES_POR_GB, 2) if not pd.isna(usado) else None,
+            "livre_gb": round(float(livre) / BYTES_POR_GB, 2) if not pd.isna(livre) else None,
+            "percent": round(float(pct), 2) if not pd.isna(pct) else None,
+        })
+    return resultado
 
 
 # CÁLCULOS DA DASHBOARD DE REDE (PANDAS)
@@ -928,10 +1104,132 @@ def montar_janelas_15m_gold_rede(df_15m):
     }
 
 
-# SILVER (CSV) E GOLD (JSON)
+# JANELAS 15M UNIFICADAS (DASHBOARDS DO ANALISTA: GERAL, CPU, RAM, DISCO E REDE)
 
-def gravar_silver(pasta_empresa, identificador, df):
-    diretorio = os.path.join(DIR_SILVER, pasta_empresa)
+def _p95_valido(serie):
+    s = pd.to_numeric(serie, errors="coerce").dropna()
+    return float(s.quantile(0.95)) if not s.empty else float("nan")
+
+
+def agregar_janelas_15m_geral(df):
+    """Agrega CPU, RAM, Disco e Rede em janelas de 15 minutos prontas para os gráficos."""
+    if df.empty or "timestamp" not in df.columns:
+        return pd.DataFrame()
+
+    sub = df.copy()
+    sub["_ts"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub = sub.dropna(subset=["_ts"]).sort_values("_ts")
+    if sub.empty:
+        return pd.DataFrame()
+
+    sub["_janela"] = sub["_ts"].dt.floor("15min")
+
+    colunas_media = [
+        "cpu_percent", "load_1m", "load_5m", "load_15m",
+        "ram_percent", "ram_usada_gb", "ram_disponivel_gb", "ram_buff_cache_usado_gb",
+        "disco_percent", "disco_leitura_mb_s", "disco_escrita_mb_s",
+        "disco_iops_leitura", "disco_iops_escrita", "disco_latencia_ms",
+        "rede_download_mb_m", "rede_upload_mb_m",
+        "rede_download_mil_pacotes_m", "rede_upload_mil_pacotes_m",
+        "rede_perda_pacotes_pct",
+    ]
+    colunas_soma = ["rede_perda_pacotes_local"]
+    colunas_ultimo = [
+        "rede_established", "rede_time_wait", "rede_close_wait", "rede_conn_total",
+        "rede_established_pct", "rede_time_wait_pct", "rede_close_wait_pct",
+        "globalping_latencia_ms", "globalping_perda_pct", "globalping_perda_pacotes",
+    ]
+
+    linhas = []
+    for janela, grupo in sub.groupby("_janela", sort=True):
+        reg = {"_ts": janela, "timestamp": janela.strftime(FORMATO_TIMESTAMP)}
+        for col in colunas_media:
+            if col in grupo.columns:
+                val = _media_valida(grupo[col])
+                reg[col] = round(val, 2) if not pd.isna(val) else None
+        if "disco_latencia_ms" in grupo.columns:
+            p95 = _p95_valido(grupo["disco_latencia_ms"])
+            reg["disco_latencia_p95_ms"] = round(p95, 2) if not pd.isna(p95) else None
+        for col in colunas_soma:
+            if col in grupo.columns:
+                val = _soma_valida(grupo[col])
+                reg[col] = round(val, 0) if not pd.isna(val) else None
+        for col in colunas_ultimo:
+            if col in grupo.columns:
+                val = _ultimo_nao_nulo(grupo[col])
+                reg[col] = round(val, 2) if not pd.isna(val) else None
+        linhas.append(reg)
+
+    return pd.DataFrame(linhas)
+
+
+def montar_janelas_15m_gold_geral(df_15m):
+    """Monta as séries de 5 pontos (gráficos rápidos) e últimas 24h (96 janelas de 15m)."""
+    campos_series = {
+        "cpu_uso_percent": "cpu_percent",
+        "cpu_load_1m": "load_1m",
+        "cpu_load_5m": "load_5m",
+        "cpu_load_15m": "load_15m",
+        "ram_uso_percent": "ram_percent",
+        "ram_usada_gb": "ram_usada_gb",
+        "ram_disponivel_gb": "ram_disponivel_gb",
+        "ram_buff_cache_gb": "ram_buff_cache_usado_gb",
+        "disco_uso_percent": "disco_percent",
+        "disco_leitura_mb_s": "disco_leitura_mb_s",
+        "disco_escrita_mb_s": "disco_escrita_mb_s",
+        "disco_iops_leitura": "disco_iops_leitura",
+        "disco_iops_escrita": "disco_iops_escrita",
+        "disco_latencia_media_ms": "disco_latencia_ms",
+        "disco_latencia_p95_ms": "disco_latencia_p95_ms",
+        "rede_perda_local": "rede_perda_pacotes_local",
+        "rede_perda_externa": "globalping_perda_pacotes",
+        "rede_latencia_externa_ms": "globalping_latencia_ms",
+        "rede_conexoes_established_pct": "rede_established_pct",
+        "rede_download_mb_m": "rede_download_mb_m",
+        "rede_upload_mb_m": "rede_upload_mb_m",
+        "rede_pacotes_download_mil_m": "rede_download_mil_pacotes_m",
+        "rede_pacotes_upload_mil_m": "rede_upload_mil_pacotes_m",
+    }
+    if df_15m is None or df_15m.empty:
+        return {"labels": [], "timestamps": [], **{k: [] for k in campos_series}, "historico_15m": []}
+
+    ultimas_5 = df_15m.tail(5).copy()
+    timestamps = [str(t) for t in ultimas_5["timestamp"].tolist()]
+    labels = [pd.to_datetime(t).strftime("%H:%M") for t in timestamps]
+    if labels:
+        labels[-1] = "Agora"
+
+    def _lista(col):
+        if col not in ultimas_5.columns:
+            return []
+        return [limpar_valor_json(v) for v in ultimas_5[col].tolist()]
+
+    ultimas_24h = df_15m.tail(96).drop(columns=["_ts"], errors="ignore")
+    hist_15m = [{k: limpar_valor_json(v) for k, v in r.items()} for r in ultimas_24h.to_dict(orient="records")]
+
+    return {
+        "labels": labels,
+        "timestamps": timestamps,
+        **{chave: _lista(col) for chave, col in campos_series.items()},
+        "historico_15m": hist_15m,
+    }
+
+
+# SILVER (CSV) E GOLD (JSON LEVE ESTRUTURADO)
+
+def _extrair_data_caminho(caminho_ou_chave):
+    """Extrai YYYY-MM-DD de caminhos particionados como <empresa>/<id>/2026-11-27/<arq>.csv."""
+    for parte in reversed(str(caminho_ou_chave).replace("\\", "/").split("/")):
+        if REGEX_DATA_DIR.match(parte):
+            return parte
+    return None
+
+
+def gravar_silver(pasta_empresa, identificador, df, data_referencia=None):
+    if data_referencia:
+        diretorio = os.path.join(DIR_SILVER, pasta_empresa, identificador, data_referencia)
+    else:
+        diretorio = os.path.join(DIR_SILVER, pasta_empresa, identificador)
     os.makedirs(diretorio, exist_ok=True)
     caminho = os.path.join(diretorio, f"{identificador}_sistema.csv")
 
@@ -957,148 +1255,201 @@ def historico(df, campos):
     return [{k: limpar_valor_json(v) for k, v in r.items()} for r in registros]
 
 
-def montar_gold(df, processos_ram=None):
+def montar_gold_estruturado(df, processos=None, particoes=None, id_instancia=None, data_referencia=None):
+    """
+    Gera os 3 artefatos Gold leves e orientados às telas do Analista de Infraestrutura/TI:
+      - atual.json: snapshot instantâneo (~5-15 KB) para cards e KPIs
+      - dashboard.json: atual + janelas 15m (24h) + resumos (~50-150 KB) para os gráficos
+      - historico/<YYYY-MM-DD>.json: histórico detalhado limitado apenas ao dia de referência
+    """
+    proc_info = processos if isinstance(processos, dict) else {"cpu_top5": [], "ram": {"maior_uso": [], "maior_crescimento": []}}
+    proc_cpu = proc_info.get("cpu_top5", [])
+    proc_ram = proc_info.get("ram", {"maior_uso": [], "maior_crescimento": []})
+    lista_particoes = particoes or []
+
     ult = lambda c: ultimo_valido(df, c)
     est = lambda c: estatisticas_serie(df[c]) if c in df.columns else estatisticas_serie(pd.Series(dtype="float64"))
+
+    df_15m_geral = agregar_janelas_15m_geral(df)
+    janelas_geral = montar_janelas_15m_gold_geral(df_15m_geral)
     df_15m_rede = agregar_janelas_15m_rede(df)
     janelas_rede = montar_janelas_15m_gold_rede(df_15m_rede)
     tendencias_rede = calcular_tendencias_rede(df, df_15m_rede)
     previsibilidade_rede = calcular_previsao_rede(df, df_15m_rede)
-    ult_15m = (lambda c: ultimo_valido(df_15m_rede, c) if not df_15m_rede.empty else ult(c))
+    ult_15m = lambda c: ultimo_valido(df_15m_rede, c) if not df_15m_rede.empty else ult(c)
 
-    return {
-        "empresa": {
-            "id": ult("empresa_id"),
-            "nome": ult("empresa_nome"),
+    ultimo_ts_str = str(df["timestamp"].iloc[-1])
+    data_ref = data_referencia or ultimo_ts_str[:10]
+
+    bloco_empresa = {
+        "id": ult("empresa_id"),
+        "nome": ult("empresa_nome"),
+    }
+    bloco_maquina = {
+        "id_instancia": id_instancia,
+        "identifier": ult("identifier"),
+        "identifier_canonico": normalizar_identificador(ult("identifier")),
+        "nome": ult("vm_nome"),
+        "hostname": ult("hostname"),
+        "os": ult("os"),
+        "primeiro_registro": str(df["timestamp"].iloc[0]),
+        "ultimo_registro": ultimo_ts_str,
+        "data_referencia": data_ref,
+        "total_registros": int(len(df)),
+        "janela_desvio_padrao": JANELA_DESVIO,
+    }
+
+    cpu_atual = {
+        "uso_percent": ult("cpu_percent"),
+        "por_nucleo": ult("cpu_por_nucleo") or [],
+        "load_average": {"1m": ult("load_1m"), "5m": ult("load_5m"), "15m": ult("load_15m")},
+        "nucleos_logicos": ult("cpu_nucleos_logicos"),
+        "qtd_processos": ult("qtd_processos"),
+        "qtd_threads": ult("qtd_threads"),
+        "modos_percent": {
+            "user": ult("cpu_user_pct"), "sys": ult("cpu_sys_pct"),
+            "nice": ult("cpu_nice_pct"), "idle": ult("cpu_idle_pct"),
+            "iowait": ult("cpu_iowait_pct"),
         },
-        "maquina": {
-            "identifier": ult("identifier"),
-            "nome": ult("vm_nome"),
-            "hostname": ult("hostname"),
-            "os": ult("os"),
-            "primeiro_registro": str(df["timestamp"].iloc[0]),
-            "ultimo_registro": str(df["timestamp"].iloc[-1]),
-            "total_registros": int(len(df)),
-            "janela_desvio_padrao": JANELA_DESVIO,
+    }
+    ram_atual = {
+        "uso_percent": ult("ram_percent"),
+        "total_gb": ult("ram_total_gb"),
+        "disponivel_gb": ult("ram_disponivel_gb"),
+        "usada_gb": ult("ram_usada_gb"),
+        "modos_gb": {
+            "cached": ult("ram_cached_gb"), "buffers": ult("ram_buffers_gb"),
+            "shared": ult("ram_shared_gb"), "slab": ult("ram_slab_gb"),
+            "available": ult("ram_disponivel_gb"),
         },
+        "buffers_cache": {
+            "usado_gb": ult("ram_buff_cache_usado_gb"),
+            "total_gb": ult("ram_buff_cache_total_gb"),
+        },
+    }
+    disco_atual = {
+        "uso_percent": ult("disco_percent"),
+        "total_gb": ult("disco_total_gb"),
+        "usado_gb": ult("disco_usado_gb"),
+        "livre_gb": ult("disco_livre_gb"),
+        "leitura_bytes_s": ult("disco_leitura_bytes_s"),
+        "escrita_bytes_s": ult("disco_escrita_bytes_s"),
+        "leitura_mb_s": ult("disco_leitura_mb_s"),
+        "escrita_mb_s": ult("disco_escrita_mb_s"),
+        "iops": {
+            "leitura": ult("disco_iops_leitura"),
+            "escrita": ult("disco_iops_escrita"),
+            "total": ult("disco_iops_total"),
+        },
+        "latencia_ms": {
+            "leitura": ult("disco_latencia_leitura_ms"),
+            "escrita": ult("disco_latencia_escrita_ms"),
+            "media": ult("disco_latencia_ms"),
+            "p95": est("disco_latencia_ms").get("p95"),
+        },
+    }
+    swap_atual = {
+        "uso_percent": ult("swap_percent"),
+        "total_gb": ult("swap_total_gb"),
+        "disponivel_gb": ult("swap_disponivel_gb"),
+        "usada_gb": ult("swap_usada_gb"),
+        "sin_mb_s": ult("swap_sin_mb_s"),
+        "sout_mb_s": ult("swap_sout_mb_s"),
+    }
+    rede_atual = {
+        "conexoes": {
+            "established": ult("rede_established"),
+            "time_wait": ult("rede_time_wait"),
+            "close_wait": ult("rede_close_wait"),
+            "total": ult("rede_conn_total"),
+            "established_pct": ult("rede_established_pct"),
+            "time_wait_pct": ult("rede_time_wait_pct"),
+            "close_wait_pct": ult("rede_close_wait_pct"),
+        },
+        "perda_pacotes_local": ult_15m("rede_perda_pacotes_local"),
+        "perda_pacotes_pct": ult("rede_perda_pacotes_pct"),
+        "upload_bytes_s": ult("rede_upload_bytes_s"),
+        "download_bytes_s": ult("rede_download_bytes_s"),
+        "volume_download_mb_m": ult_15m("rede_download_mb_m"),
+        "volume_upload_mb_m": ult_15m("rede_upload_mb_m"),
+        "pacotes_download_mil_m": ult_15m("rede_download_mil_pacotes_m"),
+        "pacotes_upload_mil_m": ult_15m("rede_upload_mil_pacotes_m"),
+    }
+    rede_globalping = {
+        "regiao": ult("globalping_regiao") or "BR",
+        "target_host": ult("globalping_target") or ult("ec2_public_ip"),
+        "latencia_externa_ms": ult("globalping_latencia_ms"),
+        "perda_externa_pacotes": ult("globalping_perda_pacotes"),
+        "perda_externa_pct": ult("globalping_perda_pct"),
+        "latencia_externa_graf": janelas_rede["latencia_externa_ms"],
+        "perda_externa_pacotes_graf": janelas_rede["perda_externa_pacotes"],
+    }
+
+    previsao_ram = calcular_previsao_ram(df)
+    alertas_ram_24h = contar_alertas_ram_24h(df)
+    proximo_pico = calcular_proximo_pico()
+
+    gold_atual = {
+        "empresa": bloco_empresa,
+        "maquina": bloco_maquina,
         "cpu": {
-            "atual": {
-                "uso_percent": ult("cpu_percent"),
-                "por_nucleo": ult("cpu_por_nucleo") or [],
-                "load_average": {"1m": ult("load_1m"), "5m": ult("load_5m"), "15m": ult("load_15m")},
-                "nucleos_logicos": ult("cpu_nucleos_logicos"),
-                "qtd_processos": ult("qtd_processos"),
-                "qtd_threads": ult("qtd_threads"),
-                "modos_percent": {
-                    "user": ult("cpu_user_pct"), "sys": ult("cpu_sys_pct"),
-                    "nice": ult("cpu_nice_pct"), "idle": ult("cpu_idle_pct"),
-                    "iowait": ult("cpu_iowait_pct"),
-                },
-            },
-            "resumo": {"uso_percent": est("cpu_percent"), "load_1m": est("load_1m")},
-            "historico": historico(df, [
-                "cpu_percent", "cpu_por_nucleo", "load_1m", "load_5m", "load_15m",
-                "cpu_user_pct", "cpu_sys_pct", "cpu_nice_pct", "cpu_idle_pct",
-                "cpu_iowait_pct", "qtd_processos",
-            ]),
+            "atual": cpu_atual,
+            "processos_top5": proc_cpu,
         },
         "ram": {
-            "atual": {
-                "uso_percent": ult("ram_percent"),
-                "total_gb": ult("ram_total_gb"),
-                "disponivel_gb": ult("ram_disponivel_gb"),
-                "usada_gb": ult("ram_usada_gb"),
-                "modos_gb": {
-                    "cached": ult("ram_cached_gb"), "buffers": ult("ram_buffers_gb"),
-                    "shared": ult("ram_shared_gb"), "slab": ult("ram_slab_gb"),
-                    "available": ult("ram_disponivel_gb"),
-                },
-                "buffers_cache": {
-                    "usado_gb": ult("ram_buff_cache_usado_gb"),
-                    "total_gb": ult("ram_buff_cache_total_gb"),
-                },
-            },
-            "resumo": {"uso_percent": est("ram_percent")},
-            "previsao": calcular_previsao_ram(df),
-            "alertas_24h": contar_alertas_ram_24h(df),
-            "proximo_pico": calcular_proximo_pico(),
-            "processos": processos_ram or {"maior_uso": [], "maior_crescimento": []},
-            "historico": historico(df, [
-                "ram_percent", "ram_usada_gb", "ram_disponivel_gb", "ram_cached_gb",
-                "ram_buffers_gb", "ram_shared_gb", "ram_slab_gb", "ram_buff_cache_usado_gb",
-            ]),
+            "atual": ram_atual,
+            "previsao": previsao_ram,
+            "alertas_24h": alertas_ram_24h,
+            "proximo_pico": proximo_pico,
+            "processos": proc_ram,
         },
         "disco": {
-            "atual": {
-                "uso_percent": ult("disco_percent"),
-                "total_gb": ult("disco_total_gb"),
-                "usado_gb": ult("disco_usado_gb"),
-                "livre_gb": ult("disco_livre_gb"),
-                "leitura_bytes_s": ult("disco_leitura_bytes_s"),
-                "escrita_bytes_s": ult("disco_escrita_bytes_s"),
-                "iops": {
-                    "leitura": ult("disco_iops_leitura"),
-                    "escrita": ult("disco_iops_escrita"),
-                    "total": ult("disco_iops_total"),
-                },
-                "latencia_ms": {
-                    "leitura": ult("disco_latencia_leitura_ms"),
-                    "escrita": ult("disco_latencia_escrita_ms"),
-                    "media": ult("disco_latencia_ms"),
-                },
-            },
+            "atual": disco_atual,
+            "particoes": lista_particoes,
+        },
+        "swap": {
+            "atual": swap_atual,
+        },
+        "rede": {
+            "atual": rede_atual,
+            "globalping": rede_globalping,
+            "tendencias": tendencias_rede,
+        },
+    }
+
+    gold_dashboard = {
+        "empresa": bloco_empresa,
+        "maquina": bloco_maquina,
+        "janelas_15m": janelas_geral,
+        "cpu": {
+            "atual": cpu_atual,
+            "resumo": {"uso_percent": est("cpu_percent"), "load_1m": est("load_1m")},
+            "processos_top5": proc_cpu,
+        },
+        "ram": {
+            "atual": ram_atual,
+            "resumo": {"uso_percent": est("ram_percent")},
+            "previsao": previsao_ram,
+            "alertas_24h": alertas_ram_24h,
+            "proximo_pico": proximo_pico,
+            "processos": proc_ram,
+        },
+        "disco": {
+            "atual": disco_atual,
+            "particoes": lista_particoes,
             "resumo": {
                 "uso_percent": est("disco_percent"),
                 "iops_total": est("disco_iops_total"),
                 "latencia_ms": est("disco_latencia_ms"),
             },
-            "historico": historico(df, [
-                "disco_percent", "disco_leitura_bytes_s", "disco_escrita_bytes_s",
-                "disco_iops_leitura", "disco_iops_escrita", "disco_iops_total",
-                "disco_latencia_leitura_ms", "disco_latencia_escrita_ms", "disco_latencia_ms",
-            ]),
         },
         "swap": {
-            "atual": {
-                "uso_percent": ult("swap_percent"),
-                "total_gb": ult("swap_total_gb"),
-                "disponivel_gb": ult("swap_disponivel_gb"),
-                "usada_gb": ult("swap_usada_gb"),
-                "sin_mb_s": ult("swap_sin_mb_s"),
-                "sout_mb_s": ult("swap_sout_mb_s"),
-            },
+            "atual": swap_atual,
             "resumo": {"uso_percent": est("swap_percent")},
-            "historico": historico(df, ["swap_percent", "swap_usada_gb", "swap_sin_mb_s", "swap_sout_mb_s"]),
         },
         "rede": {
-            "atual": {
-                "conexoes": {
-                    "established": ult("rede_established"),
-                    "time_wait": ult("rede_time_wait"),
-                    "close_wait": ult("rede_close_wait"),
-                    "total": ult("rede_conn_total"),
-                    "established_pct": ult("rede_established_pct"),
-                    "time_wait_pct": ult("rede_time_wait_pct"),
-                    "close_wait_pct": ult("rede_close_wait_pct"),
-                },
-                "perda_pacotes_local": ult_15m("rede_perda_pacotes_local"),
-                "perda_pacotes_pct": ult("rede_perda_pacotes_pct"),
-                "upload_bytes_s": ult("rede_upload_bytes_s"),
-                "download_bytes_s": ult("rede_download_bytes_s"),
-                "volume_download_mb_m": ult_15m("rede_download_mb_m"),
-                "volume_upload_mb_m": ult_15m("rede_upload_mb_m"),
-                "pacotes_download_mil_m": ult_15m("rede_download_mil_pacotes_m"),
-                "pacotes_upload_mil_m": ult_15m("rede_upload_mil_pacotes_m"),
-            },
-            "globalping": {
-                "regiao": ult("globalping_regiao") or "BR",
-                "target_host": ult("globalping_target") or ult("ec2_public_ip"),
-                "latencia_externa_ms": ult("globalping_latencia_ms"),
-                "perda_externa_pacotes": ult("globalping_perda_pacotes"),
-                "perda_externa_pct": ult("globalping_perda_pct"),
-                "latencia_externa_graf": janelas_rede["latencia_externa_ms"],
-                "perda_externa_pacotes_graf": janelas_rede["perda_externa_pacotes"],
-            },
+            "atual": rede_atual,
+            "globalping": rede_globalping,
             "janelas_15m": janelas_rede,
             "tendencias": tendencias_rede,
             "previsibilidade": previsibilidade_rede,
@@ -1113,7 +1464,44 @@ def montar_gold(df, processos_ram=None):
                 "perda_pacotes_pct": est("rede_perda_pacotes_pct"),
                 "latencia_externa_ms": est("globalping_latencia_ms"),
             },
-            "historico": historico(df, [
+        },
+    }
+
+    # Histórico diário estritamente limitado ao dia de referência
+    df_dia = df[df["timestamp"].astype(str).str.startswith(data_ref)]
+    if df_dia.empty:
+        df_dia = df
+
+    gold_historico = {
+        "empresa": bloco_empresa,
+        "maquina": bloco_maquina,
+        "data_referencia": data_ref,
+        "cpu": {
+            "historico": historico(df_dia, [
+                "cpu_percent", "cpu_por_nucleo", "load_1m", "load_5m", "load_15m",
+                "cpu_user_pct", "cpu_sys_pct", "cpu_nice_pct", "cpu_idle_pct",
+                "cpu_iowait_pct", "qtd_processos",
+            ]),
+        },
+        "ram": {
+            "historico": historico(df_dia, [
+                "ram_percent", "ram_usada_gb", "ram_disponivel_gb", "ram_cached_gb",
+                "ram_buffers_gb", "ram_shared_gb", "ram_slab_gb", "ram_buff_cache_usado_gb",
+            ]),
+        },
+        "disco": {
+            "historico": historico(df_dia, [
+                "disco_percent", "disco_leitura_bytes_s", "disco_escrita_bytes_s",
+                "disco_leitura_mb_s", "disco_escrita_mb_s",
+                "disco_iops_leitura", "disco_iops_escrita", "disco_iops_total",
+                "disco_latencia_leitura_ms", "disco_latencia_escrita_ms", "disco_latencia_ms",
+            ]),
+        },
+        "swap": {
+            "historico": historico(df_dia, ["swap_percent", "swap_usada_gb", "swap_sin_mb_s", "swap_sout_mb_s"]),
+        },
+        "rede": {
+            "historico": historico(df_dia, [
                 "rede_upload_bytes_s", "rede_download_bytes_s",
                 "rede_upload_mb_m", "rede_download_mb_m",
                 "rede_upload_mil_pacotes_m", "rede_download_mil_pacotes_m",
@@ -1125,66 +1513,27 @@ def montar_gold(df, processos_ram=None):
         },
     }
 
-# EXECUÇÃO AWS LAMBDA (ORIENTADA A EVENTO S3 NO BUCKET BRONZE)
+    return {
+        "data_referencia": data_ref,
+        "atual": gold_atual,
+        "dashboard": gold_dashboard,
+        "historico": gold_historico,
+    }
+
+
+def montar_gold(df, processos_ram=None):
+    """Compatibilidade retroativa: retorna o documento dashboard estruturado."""
+    proc = {"cpu_top5": [], "ram": processos_ram or {"maior_uso": [], "maior_crescimento": []}}
+    return montar_gold_estruturado(df, processos=proc)["dashboard"]
+
+
+# EXECUÇÃO AWS LAMBDA (OPÇÃO A: ORIENTADA APENAS A *_sistema.csv NO BUCKET BRONZE)
 
 
 def _limpar_dir_temporario():
     """Limpa o diretório /tmp usado pelo ETL entre invocações warm do Lambda."""
     if DIR_BASE.startswith("/tmp") and os.path.isdir(DIR_BASE):
         shutil.rmtree(DIR_BASE, ignore_errors=True)
-
-
-def _mesclar_indice_empresa(indice_atual, empresa_id, empresa_nome, entrada_maquina):
-    """Atualiza ou insere a máquina no índice S3 da empresa preservando as demais."""
-    if not isinstance(indice_atual, dict):
-        indice_atual = {}
-
-    maquinas_existentes = indice_atual.get("maquinas")
-    if not isinstance(maquinas_existentes, list):
-        maquinas_existentes = []
-
-    alvo = normalizar_identificador(entrada_maquina.get("identifier"))
-    atualizadas = []
-    substituida = False
-
-    for maq in maquinas_existentes:
-        if isinstance(maq, dict) and normalizar_identificador(maq.get("identifier")) == alvo:
-            atualizadas.append(entrada_maquina)
-            substituida = True
-        else:
-            atualizadas.append(maq)
-
-    if not substituida:
-        atualizadas.append(entrada_maquina)
-
-    return {
-        "empresa_id": empresa_id,
-        "empresa_nome": empresa_nome,
-        "maquinas": atualizadas,
-    }
-
-
-def _mesclar_indice_global(indice_global_atual, grupo_empresa):
-    """Atualiza ou insere a empresa no índice global S3 preservando as demais."""
-    empresas_existentes = []
-    if isinstance(indice_global_atual, dict) and isinstance(indice_global_atual.get("empresas"), list):
-        empresas_existentes = indice_global_atual["empresas"]
-
-    alvo_emp = nome_seguro(grupo_empresa.get("empresa_id"))
-    atualizadas = []
-    substituida = False
-
-    for emp in empresas_existentes:
-        if isinstance(emp, dict) and nome_seguro(emp.get("empresa_id")) == alvo_emp:
-            atualizadas.append(grupo_empresa)
-            substituida = True
-        else:
-            atualizadas.append(emp)
-
-    if not substituida:
-        atualizadas.append(grupo_empresa)
-
-    return {"empresas": atualizadas}
 
 
 def _baixar_objeto_s3_opcional(s3, bucket, chave, destino):
@@ -1203,35 +1552,33 @@ def _baixar_objeto_s3_opcional(s3, bucket, chave, destino):
 
 def _resolver_chaves_evento_bronze(chave_s3):
     """
-    A partir da chave recebida no Bucket Bronze, determina:
-    - se o arquivo deve ser ignorado;
-    - a chave do CSV de sistema e a chave opcional do CSV de processos.
+    Opção A — Eliminação de duplicidade:
+    Dispara processamento SOMENTE em *_sistema.csv (o coletor sobe auxiliares antes e
+    _sistema.csv por último; no S3 configure o gatilho com Suffix=_sistema.csv).
+    Retorna: (chave_sistema, chave_processos, chave_particoes, motivo).
     """
     if not chave_s3 or not chave_s3.lower().endswith(".csv"):
-        return None, None, "nao_csv"
+        return None, None, None, "nao_csv"
 
     nome_arq = os.path.basename(chave_s3)
     prefixo = os.path.dirname(chave_s3)
 
-    if nome_arq.endswith("_particoes.csv") or nome_arq.endswith("_conexoes_rede.csv"):
-        return None, None, "arquivo_auxiliar_ignorado"
-
-    if nome_arq.endswith("_processos.csv"):
-        nome_sistema = nome_arq.replace("_processos.csv", "_sistema.csv")
-        chave_sistema = f"{prefixo}/{nome_sistema}" if prefixo else nome_sistema
-        return chave_sistema, chave_s3, "processos"
+    if nome_arq.endswith(("_particoes.csv", "_conexoes_rede.csv", "_processos.csv")):
+        return None, None, None, "arquivo_auxiliar_ignorado"
 
     if nome_arq.endswith("_sistema.csv"):
         nome_proc = nome_arq.replace("_sistema.csv", "_processos.csv")
+        nome_part = nome_arq.replace("_sistema.csv", "_particoes.csv")
         chave_proc = f"{prefixo}/{nome_proc}" if prefixo else nome_proc
-        return chave_s3, chave_proc, "sistema"
+        chave_part = f"{prefixo}/{nome_part}" if prefixo else nome_part
+        return chave_s3, chave_proc, chave_part, "sistema"
 
-    return chave_s3, None, "csv_generico"
+    return chave_s3, None, None, "csv_generico"
 
 
 def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_silver, bucket_gold):
-    """Processa um arquivo recebido do Bucket Bronze e grava Silver, Gold e índices no S3."""
-    chave_sistema, chave_processos, tipo = _resolver_chaves_evento_bronze(chave_s3)
+    """Processa um *_sistema.csv do Bucket Bronze e grava Silver + Gold leve (atual, dashboard, historico/dia)."""
+    chave_sistema, chave_processos, chave_particoes, tipo = _resolver_chaves_evento_bronze(chave_s3)
     if not chave_sistema:
         print(f"[LAMBDA] Ignorando objeto '{chave_s3}' ({tipo}).")
         return {"chave": chave_s3, "status": "ignorado", "motivo": tipo}
@@ -1239,7 +1586,7 @@ def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_sil
     destino_sistema = os.path.join(DIR_BRONZE, chave_sistema.lstrip("/"))
     baixou_sistema = _baixar_objeto_s3_opcional(s3, bucket_bronze, chave_sistema, destino_sistema)
     if not baixou_sistema:
-        print(f"[LAMBDA] Arquivo de sistema '{chave_sistema}' ainda não encontrado no Bronze.")
+        print(f"[LAMBDA] Arquivo de sistema '{chave_sistema}' não encontrado no Bronze.")
         return {"chave": chave_s3, "status": "ignorado", "motivo": "sistema_nao_encontrado"}
 
     caminhos_processos = []
@@ -1247,6 +1594,12 @@ def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_sil
         destino_proc = os.path.join(DIR_BRONZE, chave_processos.lstrip("/"))
         if _baixar_objeto_s3_opcional(s3, bucket_bronze, chave_processos, destino_proc):
             caminhos_processos.append(destino_proc)
+
+    caminhos_particoes = []
+    if chave_particoes:
+        destino_part = os.path.join(DIR_BRONZE, chave_particoes.lstrip("/"))
+        if _baixar_objeto_s3_opcional(s3, bucket_bronze, chave_particoes, destino_part):
+            caminhos_particoes.append(destino_part)
 
     df_lido = ler_bronze(destino_sistema)
     if df_lido.empty:
@@ -1257,6 +1610,9 @@ def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_sil
     os.makedirs(DIR_GOLD, exist_ok=True)
 
     prefixo_empresa = chave_sistema.split("/", 1)[0] if "/" in chave_sistema else None
+    data_chave = _extrair_data_caminho(chave_sistema)
+    proc_dados = processar_processos(caminhos_processos)
+    part_dados = processar_particoes(caminhos_particoes)
     maquinas_processadas = []
 
     for ident_raw, df_bronze in df_lido.groupby("identifier"):
@@ -1270,72 +1626,56 @@ def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_sil
             .reset_index(drop=True)
         )
 
-        empresa_id = (
-            mapa_bd.get(identificador, {}).get("empresa_id")
-            or ultimo_valido_bronze(df_bronze, "enterprise_identifier", "empresa_id")
-            or prefixo_empresa
-            or "sem_empresa"
+        # Via 2: consulta autoritativa na API Express (com fallback seguro para BD/Bronze)
+        empresa = resolver_metadados_empresa(
+            identificador=identificador,
+            df_bronze=df_bronze,
+            mapa_bd=mapa_bd,
+            prefixo_empresa=prefixo_empresa,
         )
-        empresa_nome = (
-            mapa_bd.get(identificador, {}).get("empresa_nome")
-            or ultimo_valido_bronze(df_bronze, "enterprise_reason", "empresa_nome")
-            or "Empresa Desconhecida"
-        )
-        vm_nome = mapa_bd.get(identificador, {}).get("vm_nome")
-
-        empresa = {
-            "empresa_id": empresa_id,
-            "empresa_nome": empresa_nome,
-            "vm_nome": vm_nome,
-        }
 
         df_tratado = transformar_dataframe(df_bronze, empresa)
         if df_tratado.empty:
             continue
 
         nome = nome_seguro(identificador)
-        pasta_empresa = nome_seguro(empresa_id)
+        pasta_empresa = nome_seguro(empresa["empresa_id"])
+        data_ref = data_chave or str(df_tratado["timestamp"].iloc[-1])[:10]
 
-        # 1. Silver -> S3 Silver
-        caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado)
-        chave_s3_silver = f"{pasta_empresa}/{os.path.basename(caminho_silver)}"
+        # 1. Silver -> S3 Silver (<empresa>/<id>/<YYYY-MM-DD>/<id>_sistema.csv)
+        caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado, data_referencia=data_ref)
+        chave_s3_silver = f"{pasta_empresa}/{nome}/{data_ref}/{os.path.basename(caminho_silver)}"
         enviar_para_s3(caminho_silver, chave_s3_silver, bucket=bucket_silver, propagar_erro=True)
 
-        # 2. Gold -> S3 Gold
-        proc_ram = processar_processos_ram(caminhos_processos)
-        gold = montar_gold(df_tratado, processos_ram=proc_ram)
+        # 2. Gold leve estruturado -> S3 Gold (sem escrita concorrente em índice global)
+        pacote_gold = montar_gold_estruturado(
+            df_tratado,
+            processos=proc_dados,
+            particoes=part_dados,
+            id_instancia=empresa.get("id_instancia"),
+            data_referencia=data_ref,
+        )
 
-        nome_arquivo_gold = f"{nome}_sistema.json"
-        chave_s3_gold = f"{pasta_empresa}/{nome_arquivo_gold}"
-        enviar_para_s3(None, chave_s3_gold, bucket=bucket_gold, documento=gold, propagar_erro=True)
+        chave_gold_atual = f"{pasta_empresa}/{nome}/atual.json"
+        chave_gold_dashboard = f"{pasta_empresa}/{nome}/dashboard.json"
+        chave_gold_historico = f"{pasta_empresa}/{nome}/historico/{data_ref}.json"
 
-        # 3. Atualização incremental dos índices no S3 Gold
-        entrada_maquina_s3 = {
-            **gold["maquina"],
-            "arquivo": nome_arquivo_gold,
-            "cpu_percent": gold["cpu"]["atual"]["uso_percent"],
-            "ram_percent": gold["ram"]["atual"]["uso_percent"],
-            "disco_percent": gold["disco"]["atual"]["uso_percent"],
-        }
-
-        chave_indice_emp = f"indice_maquinas_empresa_{pasta_empresa}.json"
-        indice_emp_atual = ler_json_s3(s3, bucket_gold, chave_indice_emp)
-        grupo_s3 = _mesclar_indice_empresa(indice_emp_atual, empresa_id, empresa_nome, entrada_maquina_s3)
-        enviar_para_s3(None, chave_indice_emp, bucket=bucket_gold, documento=grupo_s3, propagar_erro=True)
-
-        chave_indice_global = "indice_maquinas.json"
-        indice_global_atual = ler_json_s3(s3, bucket_gold, chave_indice_global)
-        indice_global_novo = _mesclar_indice_global(indice_global_atual, grupo_s3)
-        enviar_para_s3(None, chave_indice_global, bucket=bucket_gold, documento=indice_global_novo, propagar_erro=True)
+        enviar_para_s3(None, chave_gold_atual, bucket=bucket_gold, documento=pacote_gold["atual"], propagar_erro=True)
+        enviar_para_s3(None, chave_gold_dashboard, bucket=bucket_gold, documento=pacote_gold["dashboard"], propagar_erro=True)
+        enviar_para_s3(None, chave_gold_historico, bucket=bucket_gold, documento=pacote_gold["historico"], propagar_erro=True)
 
         maquinas_processadas.append({
             "identificador": identificador,
-            "empresa_id": empresa_id,
+            "id_instancia": empresa.get("id_instancia"),
+            "empresa_id": empresa["empresa_id"],
+            "data_referencia": data_ref,
             "registros": len(df_tratado),
             "silver": f"s3://{bucket_silver}/{chave_s3_silver}",
-            "gold": f"s3://{bucket_gold}/{chave_s3_gold}",
+            "gold_atual": f"s3://{bucket_gold}/{chave_gold_atual}",
+            "gold_dashboard": f"s3://{bucket_gold}/{chave_gold_dashboard}",
+            "gold_historico": f"s3://{bucket_gold}/{chave_gold_historico}",
         })
-        print(f"  [LAMBDA OK] {identificador} ({empresa_nome}): {len(df_tratado)} registros processados.")
+        print(f"  [LAMBDA OK] {identificador} ({empresa['empresa_nome']} | {data_ref}): {len(df_tratado)} registros processados.")
 
     return {
         "chave": chave_s3,
@@ -1346,7 +1686,8 @@ def processar_arquivo_bronze_s3(s3, bucket_bronze, chave_s3, mapa_bd, bucket_sil
 
 def lambda_handler(event, context):
     """
-    Handler AWS Lambda (Python 3.12) acionado por eventos S3 (ObjectCreated) no Bucket Bronze.
+    Handler AWS Lambda (Python 3.12) acionado por eventos S3 (ObjectCreated, Suffix=_sistema.csv)
+    no Bucket Bronze.
     """
     bucket_silver = os.getenv("AWS_BUCKET_SILVER", AWS_BUCKET_SILVER).strip()
     bucket_gold = os.getenv("AWS_BUCKET_GOLD", AWS_BUCKET_GOLD).strip()
@@ -1373,6 +1714,7 @@ def lambda_handler(event, context):
     chaves_processadas = set()
 
     try:
+        # Via 2 usa API_BASE_URL por instância; carregar_maquinas_bd só atua se DB_HOST estiver definido
         mapa_bd = carregar_maquinas_bd()
 
         for record in registros:
@@ -1390,9 +1732,12 @@ def lambda_handler(event, context):
                     f"Bucket de origem ({bucket_bronze}) não pode ser igual ao Silver ou Gold (evita loop infinito)."
                 )
 
-            # Evita processar a mesma máquina duas vezes caso sistema e processos cheguem no mesmo batch
-            chave_sistema, _, _ = _resolver_chaves_evento_bronze(chave_s3)
-            chave_dedup = (bucket_bronze, chave_sistema or chave_s3)
+            chave_sistema, _, _, motivo = _resolver_chaves_evento_bronze(chave_s3)
+            if not chave_sistema:
+                resultados.append({"chave": chave_s3, "status": "ignorado", "motivo": motivo})
+                continue
+
+            chave_dedup = (bucket_bronze, chave_sistema)
             if chave_dedup in chaves_processadas:
                 resultados.append({"chave": chave_s3, "status": "ignorado", "motivo": "duplicado_no_lote"})
                 continue
@@ -1442,17 +1787,25 @@ def main():
 
     mapa_bd = carregar_maquinas_bd()
 
-    dfs_por_maquina = {}
+    dfs_por_maquina_dia = {}
     arquivos_processos = {}
+    arquivos_particoes = {}
 
     for caminho in arquivos:
-        if "_particoes.csv" in caminho or "_conexoes_rede.csv" in caminho:
+        nome_base = os.path.basename(caminho)
+        data_arq = _extrair_data_caminho(caminho)
+
+        if nome_base.endswith("_conexoes_rede.csv"):
             continue
-        if "_processos.csv" in caminho:
-            nome_arq = os.path.basename(caminho).replace("_processos.csv", "")
-            chave = normalizar_identificador(nome_arq)
-            if chave:
-                arquivos_processos.setdefault(chave, []).append(caminho)
+        if nome_base.endswith("_particoes.csv"):
+            chave_id = normalizar_identificador(nome_base.replace("_particoes.csv", ""))
+            if chave_id:
+                arquivos_particoes.setdefault((chave_id, data_arq), []).append(caminho)
+            continue
+        if nome_base.endswith("_processos.csv"):
+            chave_id = normalizar_identificador(nome_base.replace("_processos.csv", ""))
+            if chave_id:
+                arquivos_processos.setdefault((chave_id, data_arq), []).append(caminho)
             continue
 
         print(f"Lendo {caminho}")
@@ -1460,100 +1813,83 @@ def main():
         if df_lido.empty:
             continue
 
-        for ident_raw, grupo_df in df_lido.groupby("identifier"):
-            chave = normalizar_identificador(ident_raw)
-            if chave:
-                dfs_por_maquina.setdefault(chave, []).append(grupo_df)
+        rel = os.path.relpath(caminho, DIR_BRONZE).replace("\\", "/")
+        prefixo_emp = rel.split("/", 1)[0] if "/" in rel else None
 
-    if not dfs_por_maquina:
+        for ident_raw, grupo_df in df_lido.groupby("identifier"):
+            chave_id = normalizar_identificador(ident_raw)
+            if not chave_id:
+                continue
+            dia_ref = data_arq or str(grupo_df["_ts"].iloc[-1].strftime("%Y-%m-%d"))
+            dfs_por_maquina_dia.setdefault((chave_id, dia_ref), {"dfs": [], "prefixo": prefixo_emp})["dfs"].append(grupo_df)
+
+    if not dfs_por_maquina_dia:
         print("[AVISO] Nenhuma linha válida encontrada nos arquivos bronze.")
         return
 
-    indice = {}
-    for identificador, lista_dfs in dfs_por_maquina.items():
-        df_bronze = pd.concat(lista_dfs, ignore_index=True)
+    maquinas_unicas = set()
+    empresas_unicas = set()
+
+    for (identificador, data_ref), bloco in sorted(dfs_por_maquina_dia.items()):
+        df_bronze = pd.concat(bloco["dfs"], ignore_index=True)
         df_bronze = df_bronze.sort_values("_ts").drop_duplicates(subset=["identifier", "_ts"], keep="last").reset_index(drop=True)
 
-        empresa_id = (
-            mapa_bd.get(identificador, {}).get("empresa_id")
-            or ultimo_valido_bronze(df_bronze, "enterprise_identifier", "empresa_id")
-            or "sem_empresa"
+        empresa = resolver_metadados_empresa(
+            identificador=identificador,
+            df_bronze=df_bronze,
+            mapa_bd=mapa_bd,
+            prefixo_empresa=bloco["prefixo"],
         )
-        empresa_nome = (
-            mapa_bd.get(identificador, {}).get("empresa_nome")
-            or ultimo_valido_bronze(df_bronze, "enterprise_reason", "empresa_nome")
-            or "Empresa Desconhecida"
-        )
-        vm_nome = mapa_bd.get(identificador, {}).get("vm_nome")
-
-        empresa = {
-            "empresa_id": empresa_id,
-            "empresa_nome": empresa_nome,
-            "vm_nome": vm_nome,
-        }
 
         df_tratado = transformar_dataframe(df_bronze, empresa)
         if df_tratado.empty:
             continue
 
         nome = nome_seguro(identificador)
-        pasta_empresa = nome_seguro(empresa_id)
+        pasta_empresa = nome_seguro(empresa["empresa_id"])
 
         # Silver
-        caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado)
-        chave_s3_silver = f"{pasta_empresa}/{os.path.basename(caminho_silver)}"
+        caminho_silver = gravar_silver(pasta_empresa, nome, df_tratado, data_referencia=data_ref)
+        chave_s3_silver = f"{pasta_empresa}/{nome}/{data_ref}/{os.path.basename(caminho_silver)}"
         enviar_para_s3(caminho_silver, chave_s3_silver, bucket=AWS_BUCKET_SILVER)
 
-        # Gold
-        proc_ram = processar_processos_ram(arquivos_processos.get(identificador, []))
-        gold = montar_gold(df_tratado, processos_ram=proc_ram)
+        # Auxiliares (processos e partições do dia ou legado sem data)
+        caminhos_proc = arquivos_processos.get((identificador, data_ref)) or arquivos_processos.get((identificador, None), [])
+        caminhos_part = arquivos_particoes.get((identificador, data_ref)) or arquivos_particoes.get((identificador, None), [])
+        proc_dados = processar_processos(caminhos_proc)
+        part_dados = processar_particoes(caminhos_part)
 
-        dir_gold_empresa = os.path.join(DIR_GOLD, pasta_empresa)
-        os.makedirs(dir_gold_empresa, exist_ok=True)
-        caminho_gold = os.path.join(dir_gold_empresa, f"{nome}_sistema.json")
+        # Gold leve estruturado
+        pacote_gold = montar_gold_estruturado(
+            df_tratado,
+            processos=proc_dados,
+            particoes=part_dados,
+            id_instancia=empresa.get("id_instancia"),
+            data_referencia=data_ref,
+        )
 
-        with open(caminho_gold, "w", encoding="utf-8") as f:
-            json.dump(gold, f, ensure_ascii=False, indent=2)
+        dir_gold_maq = os.path.join(DIR_GOLD, pasta_empresa, nome)
+        dir_gold_hist = os.path.join(dir_gold_maq, "historico")
+        os.makedirs(dir_gold_hist, exist_ok=True)
 
-        chave_s3_gold_maq = f"{pasta_empresa}/{os.path.basename(caminho_gold)}"
-        enviar_para_s3(caminho_gold, chave_s3_gold_maq, bucket=AWS_BUCKET_GOLD)
+        caminho_atual = os.path.join(dir_gold_maq, "atual.json")
+        caminho_dashboard = os.path.join(dir_gold_maq, "dashboard.json")
+        caminho_historico = os.path.join(dir_gold_hist, f"{data_ref}.json")
 
-        grupo = indice.setdefault(pasta_empresa, {
-            "empresa_id": empresa_id,
-            "empresa_nome": empresa_nome,
-            "maquinas": [],
-        })
-        grupo["maquinas"].append({
-            **gold["maquina"],
-            "arquivo": f"{pasta_empresa}/{os.path.basename(caminho_gold)}",
-            "cpu_percent": gold["cpu"]["atual"]["uso_percent"],
-            "ram_percent": gold["ram"]["atual"]["uso_percent"],
-            "disco_percent": gold["disco"]["atual"]["uso_percent"],
-        })
-        print(f"  OK {identificador} ({empresa_nome}): {len(df_tratado)} registros -> {caminho_silver} | {caminho_gold}")
+        for caminho_arq, doc, chave_s3 in (
+            (caminho_atual, pacote_gold["atual"], f"{pasta_empresa}/{nome}/atual.json"),
+            (caminho_dashboard, pacote_gold["dashboard"], f"{pasta_empresa}/{nome}/dashboard.json"),
+            (caminho_historico, pacote_gold["historico"], f"{pasta_empresa}/{nome}/historico/{data_ref}.json"),
+        ):
+            with open(caminho_arq, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+            enviar_para_s3(caminho_arq, chave_s3, bucket=AWS_BUCKET_GOLD, documento=doc)
 
-    grupos_s3 = []
-    for pasta_empresa, grupo in indice.items():
-        caminho_indice_emp = os.path.join(DIR_GOLD, pasta_empresa, "indice_maquinas.json")
-        with open(caminho_indice_emp, "w", encoding="utf-8") as f:
-            json.dump(grupo, f, ensure_ascii=False, indent=2)
+        maquinas_unicas.add((pasta_empresa, nome))
+        empresas_unicas.add(pasta_empresa)
+        print(f"  OK {identificador} ({empresa['empresa_nome']} | {data_ref}): {len(df_tratado)} registros -> {caminho_silver} | {dir_gold_maq}")
 
-        grupo_s3 = {**grupo, "maquinas": [
-            {**m, "arquivo": os.path.basename(m["arquivo"])} for m in grupo["maquinas"]
-        ]}
-        grupos_s3.append(grupo_s3)
-        enviar_para_s3(caminho_indice_emp, f"indice_maquinas_empresa_{pasta_empresa}.json",
-                       AWS_BUCKET_GOLD, documento=grupo_s3)
-
-    caminho_indice_global = os.path.join(DIR_GOLD, "indice_maquinas.json")
-    with open(caminho_indice_global, "w", encoding="utf-8") as f:
-        json.dump({"empresas": list(indice.values())}, f, ensure_ascii=False, indent=2)
-
-    enviar_para_s3(caminho_indice_global, "indice_maquinas.json", AWS_BUCKET_GOLD,
-                   documento={"empresas": grupos_s3})
-
-    total = sum(len(g["maquinas"]) for g in indice.values())
-    print(f"Concluído: {total} máquina(s) de {len(indice)} empresa(s) processada(s).")
+    print(f"Concluído: {len(maquinas_unicas)} máquina(s) de {len(empresas_unicas)} empresa(s) processada(s).")
 
 
 if __name__ == "__main__":
